@@ -13,6 +13,7 @@ toml = { workspace = true }
 ipnet = { workspace = true }
 notify = { workspace = true }
 uuid = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
