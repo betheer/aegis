@@ -10,6 +10,7 @@ pub struct Verdict {
 
 /// Ordered, compiled rule set for O(n) packet evaluation.
 /// Rules are pre-sorted by priority (ascending) at construction.
+#[derive(Debug)]
 pub struct RuleEngine {
     rules: Vec<Rule>,
 }

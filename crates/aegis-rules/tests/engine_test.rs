@@ -105,17 +105,30 @@ proptest! {
     fn engine_never_panics_on_any_packet(
         src_a in 0u8..=255, src_b in 0u8..=255,
         dst_port in 0u16..=65535,
+        proto_idx in 0usize..4,
+        dir_idx in 0usize..3,
     ) {
         let engine = RuleEngine::new(vec![ssh_allow_rule(), default_block_rule()]);
+        let proto = match proto_idx {
+            0 => Protocol::Tcp,
+            1 => Protocol::Udp,
+            2 => Protocol::Icmp,
+            _ => Protocol::Any,
+        };
+        let direction = match dir_idx {
+            0 => Direction::Inbound,
+            1 => Direction::Outbound,
+            _ => Direction::Forward,
+        };
         let pkt = PacketInfo {
             src_ip: format!("{}.{}.1.1", src_a, src_b).parse().unwrap(),
             dst_ip: "10.0.0.1".parse().unwrap(),
             src_port: Some(12345),
             dst_port: Some(dst_port),
-            protocol: Protocol::Tcp,
-            direction: Direction::Inbound,
+            protocol: proto,
+            direction,
         };
-        // Should never panic
+        // Should never panic regardless of input
         let _ = engine.evaluate(&pkt);
     }
 }
