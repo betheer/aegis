@@ -1978,7 +1978,11 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
 }
 ```
 
-Create migration file:
+Create migrations directory and file:
+```bash
+mkdir -p crates/aegis-store/migrations
+```
+
 ```sql
 -- crates/aegis-store/migrations/001_initial.sql
 
