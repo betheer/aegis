@@ -285,7 +285,13 @@ pub trait FirewallBackend: Send + Sync {
     /// Flush all rules. Fails closed — no traffic allowed after flush.
     async fn flush(&self) -> Result<()>;
 
-    /// Return the currently active nftables JSON, as reported by the backend.
+    /// Return the currently active ruleset as nftables JSON, as reported by the backend.
+    ///
+    /// NOTE: The spec (§4.1) declares `list_active_rules() -> Result<Vec<Rule>>` but
+    /// `Rule` lives in `aegis-rules` which already depends on `aegis-core` — a circular
+    /// dependency. The backend only knows nftables JSON (not Rust Rule structs), so
+    /// returning the raw JSON string is both correct and avoids the cycle. The daemon
+    /// layer (aegis-daemon) translates JSON → Rule when needed.
     async fn list_active(&self) -> Result<String>;
 }
 ```
