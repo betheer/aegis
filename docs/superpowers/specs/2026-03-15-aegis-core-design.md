@@ -980,9 +980,61 @@ aegis doctor
 
 ---
 
-## 12. Observability
+## 12. Lifecycle Management
 
-### 12.1 Metrics (Prometheus)
+### 12.1 First-Run Setup (`aegis setup`)
+
+Run once after install. Idempotent — safe to re-run:
+1. Generate 32-byte random `machine.key` → `/etc/aegis/secrets/machine.key`
+2. Derive SQLCipher key + audit HMAC key via Argon2id
+3. Generate CA keypair + admin client cert via `rcgen` crate
+4. Initialize SQLite database, run migrations, write genesis audit entry
+5. Install and enable systemd units
+6. Download GeoLite2 DB if license key provided
+7. Print post-setup summary with socket paths and cert fingerprints
+
+### 12.2 Signal Handling
+
+| Signal | aegis-daemon | aegis-privileged |
+|---|---|---|
+| `SIGTERM` | Begin graceful shutdown (see §12.3) | Begin graceful shutdown |
+| `SIGHUP` | Reload config + rules (same as gRPC `Reload`) | No-op |
+| `SIGINT` | Same as `SIGTERM` (dev convenience) | Same as `SIGTERM` |
+| `SIGUSR1` | Rotate log file | No-op |
+
+### 12.3 Graceful Shutdown Sequence
+
+Triggered by `SIGTERM` or systemd stop. Must complete within `TimeoutStopSec=10s`:
+
+```
+1. Stop accepting new gRPC connections (close listener)
+2. Drain active gRPC streams (allow up to 3s for TUI/CLI to disconnect)
+3. Send NFQUEUE drain signal → verdict all pending packets DROP (fail closed)
+4. Flush detection event batch buffer → write remaining events to SQLite
+5. Flush ip_stats DashMap → write to SQLite
+6. Checkpoint SQLite WAL (PRAGMA wal_checkpoint(TRUNCATE))
+7. Close SQLite connection pool
+8. Send shutdown IPC message to aegis-privileged
+9. Wait for aegis-privileged to confirm shutdown (up to 2s), then exit
+```
+
+If any step times out, log the failure and continue — partial shutdown is preferable to hanging indefinitely.
+
+### 12.4 IPC Protocol Versioning
+
+First message after aegis-daemon connects to aegis-privileged:
+```rust
+IpcMessage::Handshake { protocol_version: u32 }  // current: 1
+// privileged responds:
+IpcMessage::HandshakeAck { accepted: bool, server_version: u32 }
+```
+If versions are incompatible (e.g., after a partial upgrade), privileged rejects connection and daemon logs a clear error. Prevents silent data corruption from format mismatches across versions.
+
+---
+
+## 13. Observability
+
+### 13.1 Metrics (Prometheus)
 Exposed from daemon's internal HTTP server on `127.0.0.1:9100/metrics` (not gRPC). Key metrics:
 - `aegis_packets_total{verdict}` — packets by verdict
 - `aegis_detection_score_histogram` — risk score distribution
@@ -990,15 +1042,15 @@ Exposed from daemon's internal HTTP server on `127.0.0.1:9100/metrics` (not gRPC
 - `aegis_events_written_total` — event store throughput
 - `aegis_ruleset_version` — current ruleset apply counter
 
-### 12.2 Tracing (OpenTelemetry)
+### 13.2 Tracing (OpenTelemetry)
 `opentelemetry` + `tracing-opentelemetry` + `opentelemetry-otlp`. Exports to OTLP endpoint (configurable, default disabled). Every packet through detection gets a span. Every gRPC call instrumented via tower middleware.
 
-### 12.3 Structured Logging
+### 13.3 Structured Logging
 `tracing` crate with `tracing-subscriber` JSON formatter. Correlation IDs on all gRPC calls and packet traces. Output: systemd journal (via `tracing-journald`) + optional JSON log file.
 
 ---
 
-## 13. Testing Strategy
+## 14. Testing Strategy
 
 | Layer | Approach | Tooling |
 |---|---|---|
@@ -1013,7 +1065,7 @@ Benchmarks run in CI; any regression against SLOs in §9.3 blocks merge.
 
 ---
 
-## 14. Key Dependencies
+## 15. Key Dependencies
 
 | Crate | Purpose |
 |---|---|
@@ -1052,6 +1104,8 @@ Benchmarks run in CI; any regression against SLOs in §9.3 blocks merge.
 | `bincode` | IPC wire format |
 | `serde_json` | nftables JSON generation |
 | `argon2` | Key derivation for SQLCipher + audit HMAC |
+| `rcgen` | TLS certificate generation (CA + client certs) |
+| `signal-hook` | Async signal handling (SIGTERM, SIGHUP, SIGINT, SIGUSR1) |
 | `protovalidate` | Proto field validation at runtime |
 | `thiserror` | Library error types |
 | `anyhow` | Application error handling |
