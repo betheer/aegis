@@ -232,7 +232,16 @@ pub enum CoreError {
 pub type Result<T> = std::result::Result<T, CoreError>;
 ```
 
-- [ ] **Step 3: Write failing test for error types**
+- [ ] **Step 3: Write stub `lib.rs` with only `error` module (so tests get the right failure message)**
+
+```rust
+// crates/aegis-core/src/lib.rs
+pub mod error;
+pub use error::{CoreError, Result};
+// backend module added in Step 6 after backend.rs is written
+```
+
+- [ ] **Step 4: Write failing test for error types**
 
 ```rust
 // crates/aegis-core/tests/backend_trait.rs
@@ -250,14 +259,15 @@ fn core_error_display() {
 }
 ```
 
-- [ ] **Step 4: Run test (expect compile failure — types not exported yet)**
+- [ ] **Step 5: Run test (expect compile failure — `FirewallBackend` not yet exported)**
 
 ```bash
 cargo test -p aegis-core 2>&1 | head -20
 ```
-Expected: compile error about `aegis_core::CoreError` not found.
+Expected: test compiles and the `core_error_display` test passes (error types are exported).
+The async mock tests added in Step 7 will fail to compile until `backend.rs` is written — that is the intended TDD "red" state.
 
-- [ ] **Step 5: Write `backend.rs`**
+- [ ] **Step 6: Write `backend.rs`**
 
 ```rust
 // crates/aegis-core/src/backend.rs
@@ -296,7 +306,7 @@ pub trait FirewallBackend: Send + Sync {
 }
 ```
 
-- [ ] **Step 6: Write `lib.rs`**
+- [ ] **Step 7: Update `lib.rs` to export `backend` module**
 
 ```rust
 // crates/aegis-core/src/lib.rs
@@ -307,7 +317,7 @@ pub use backend::{FirewallBackend, Ruleset};
 pub use error::{CoreError, Result};
 ```
 
-- [ ] **Step 7: Add mock backend to test file and write trait test**
+- [ ] **Step 8: Add mock backend to test file and write trait test**
 
 ```rust
 // crates/aegis-core/tests/backend_trait.rs
@@ -380,7 +390,7 @@ fn core_error_display() {
 }
 ```
 
-- [ ] **Step 8: Add tokio dev dependency and run tests**
+- [ ] **Step 9: Add tokio dev dependency and run tests**
 
 Add to `crates/aegis-core/Cargo.toml`:
 ```toml
@@ -393,7 +403,7 @@ cargo test -p aegis-core -- --nocapture
 ```
 Expected: all 3 tests pass.
 
-- [ ] **Step 9: Lint**
+- [ ] **Step 10: Lint**
 
 ```bash
 cargo fmt -p aegis-core
@@ -401,7 +411,7 @@ cargo clippy -p aegis-core -- -D warnings
 ```
 Expected: no warnings.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add crates/aegis-core/
