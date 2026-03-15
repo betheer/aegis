@@ -457,23 +457,21 @@ edition = "2021"
 
 [dependencies]
 aegis-core = { path = "../aegis-core" }
-async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 ipnet = { workspace = true }
-tokio = { workspace = true }
 notify = { workspace = true }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 proptest = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
 ```
 
-Also add `uuid = "1"` and `notify = "6"` and `tempfile = "3"` to `[workspace.dependencies]` in root `Cargo.toml`.
+Note: `uuid`, `notify`, and `tempfile` are already declared in the workspace root `Cargo.toml` from Task 1. No additions needed.
 
 - [ ] **Step 2: Write failing test for model types**
 
@@ -1571,10 +1569,10 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
 ```
 
-Add `rusqlite_migration = "1"` to workspace dependencies.
+Note: all dependencies are already in the workspace root `Cargo.toml` from Task 1. No additions needed.
 
 - [ ] **Step 2: Write failing model test**
 
