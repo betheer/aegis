@@ -1396,7 +1396,7 @@ cargo test -p aegis-rules --test compiler_test -- --nocapture
 ```
 Expected: all 4 tests pass.
 
-- [ ] **Step 6: Lint and commit**
+- [ ] **Step 5: Lint and commit**
 
 ```bash
 cargo fmt -p aegis-rules && cargo clippy -p aegis-rules -- -D warnings
@@ -1556,7 +1556,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 rusqlite = { workspace = true }
 rusqlite_migration = { workspace = true }
-ringbuf = { workspace = true }
+crossbeam-queue = { workspace = true }
 dashmap = { workspace = true }
 argon2 = { workspace = true }
 sha2 = { workspace = true }
