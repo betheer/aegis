@@ -2195,47 +2195,51 @@ fn query_events_by_severity() {
 
 - [ ] **Step 2: Implement `ring.rs`**
 
+Note: add `crossbeam-queue = "0.3"` to `[workspace.dependencies]` in root `Cargo.toml` and to `crates/aegis-store/Cargo.toml`.
+
 ```rust
 // crates/aegis-store/src/ring.rs
+//! Lock-free bounded MPSC event ring buffer (hot tier).
+//!
+//! Uses `crossbeam_queue::ArrayQueue` — a true lock-free bounded MPSC queue.
+//! `ringbuf`'s HeapRb is SPSC only; wrapping it in Mutex defeats lock-freedom.
+//! The TUI live feed subscribes via the gRPC ManageSession stream (daemon layer),
+//! not by reading this buffer directly — this buffer exists only to batch events
+//! for SQLite writes.
 use crate::model::Event;
-use ringbuf::{HeapRb, Prod, Cons};
-use std::sync::{Arc, Mutex};
+use crossbeam_queue::ArrayQueue;
+use std::sync::Arc;
 
 const DEFAULT_CAPACITY: usize = 50_000;
 
-/// Lock-free ring buffer for recent events (hot tier).
-/// Producer: detection pipeline. Consumer: TUI live feed + batch writer.
+/// Bounded lock-free event buffer. Push from detection threads; drain for SQLite writes.
+/// Clone to share across threads — all clones share the same underlying queue.
+#[derive(Clone)]
 pub struct EventRing {
-    producer: Arc<Mutex<Prod<Event, Arc<HeapRb<Event>>>>>,
-    consumer: Arc<Mutex<Cons<Event, Arc<HeapRb<Event>>>>>,
+    queue: Arc<ArrayQueue<Event>>,
 }
 
 impl EventRing {
     pub fn new() -> Self {
-        let rb = Arc::new(HeapRb::<Event>::new(DEFAULT_CAPACITY));
-        let (prod, cons) = rb.split();
-        Self {
-            producer: Arc::new(Mutex::new(prod)),
-            consumer: Arc::new(Mutex::new(cons)),
-        }
+        Self { queue: Arc::new(ArrayQueue::new(DEFAULT_CAPACITY)) }
     }
 
-    /// Push an event. If ring is full, oldest event is overwritten (circular).
+    /// Push an event. If the queue is full, the oldest event is dropped to make room.
+    /// Safe to call from multiple threads concurrently.
     pub fn push(&self, event: Event) {
-        let mut prod = self.producer.lock().unwrap();
-        if prod.is_full() {
-            // pop one to make room
-            self.consumer.lock().unwrap().try_pop();
+        if self.queue.is_full() {
+            // Drop oldest — ring buffer semantics
+            let _ = self.queue.pop();
         }
-        let _ = prod.try_push(event);
+        // If push fails (race: another thread filled it between is_full and push), drop silently.
+        let _ = self.queue.push(event);
     }
 
-    /// Drain up to `max` events for batch writing.
+    /// Drain up to `max` events for batch SQLite writing. Safe to call from one writer thread.
     pub fn drain(&self, max: usize) -> Vec<Event> {
-        let mut cons = self.consumer.lock().unwrap();
-        let mut out = Vec::with_capacity(max.min(cons.len()));
+        let mut out = Vec::with_capacity(max);
         for _ in 0..max {
-            match cons.try_pop() {
+            match self.queue.pop() {
                 Some(e) => out.push(e),
                 None => break,
             }
@@ -2243,11 +2247,8 @@ impl EventRing {
         out
     }
 
-    /// Peek last N events for TUI live feed (non-consuming).
-    pub fn recent(&self, n: usize) -> Vec<Event> {
-        let cons = self.consumer.lock().unwrap();
-        cons.iter().rev().take(n).cloned().collect()
-    }
+    pub fn len(&self) -> usize { self.queue.len() }
+    pub fn is_empty(&self) -> bool { self.queue.is_empty() }
 }
 
 impl Default for EventRing {
