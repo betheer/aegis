@@ -24,7 +24,7 @@ toml = "0.8"
 ipnet = { version = "2", features = ["serde"] }
 
 # Storage
-rusqlite = { version = "0.31", features = ["bundled-sqlcipher", "modern_sqlite"] }
+rusqlite = { version = "0.31", features = ["bundled", "modern_sqlite"] }
 rusqlite_migration = "1"
 crossbeam-queue = "0.3"
 dashmap = "6"
