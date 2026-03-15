@@ -2,7 +2,6 @@ use crate::{
     error::{Result, RulesError},
     model::Rule,
 };
-use std::collections::HashSet;
 
 /// Parse and validate a TOML string into an ordered list of rules.
 /// Returns error on invalid TOML, invalid field values, or duplicate IDs.
@@ -27,9 +26,10 @@ pub fn parse_rules_file(path: &std::path::Path) -> Result<Vec<Rule>> {
 }
 
 fn validate_rules(mut rules: Vec<Rule>) -> Result<Vec<Rule>> {
-    let mut seen_ids = HashSet::new();
+    use std::collections::HashMap;
+    let mut seen_ids: HashMap<String, usize> = HashMap::new();
 
-    for rule in &rules {
+    for (idx, rule) in rules.iter().enumerate() {
         // Priority range check (u32 field but spec says max 65535)
         if rule.priority > 65535 {
             return Err(RulesError::ValidationError {
@@ -38,14 +38,18 @@ fn validate_rules(mut rules: Vec<Rule>) -> Result<Vec<Rule>> {
             });
         }
 
-        // Duplicate ID check
-        if !seen_ids.insert(rule.id.clone()) {
+        // Duplicate ID check — track first occurrence index
+        if let Some(&first_idx) = seen_ids.get(&rule.id) {
             return Err(RulesError::ConflictError {
                 id: rule.id.clone(),
-                other_id: rule.id.clone(),
-                detail: "duplicate rule ID".to_string(),
+                other_id: rules[first_idx].id.clone(),
+                detail: format!(
+                    "duplicate rule ID (first seen at position {}, repeated at position {})",
+                    first_idx, idx
+                ),
             });
         }
+        seen_ids.insert(rule.id.clone(), idx);
 
         // Name must not be empty
         if rule.name.trim().is_empty() {
