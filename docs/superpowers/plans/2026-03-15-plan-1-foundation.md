@@ -1254,7 +1254,7 @@ fn compile_block_rule_contains_drop_verdict() {
     let rule = Rule {
         id: "block-all".to_string(),
         priority: 1000,
-        name = "Block all".to_string(),
+        name: "Block all".to_string(),
         enabled: true,
         matches: vec![],
         action: Action::Block,
@@ -1389,11 +1389,7 @@ fn compile_rule(rule: &Rule) -> Value {
 }
 ```
 
-- [ ] **Step 4: Fix test syntax error (name = should be name:)**
-
-In compiler_test.rs line `name = "Block all".to_string(),` → `name: "Block all".to_string(),`
-
-- [ ] **Step 5: Run compiler tests**
+- [ ] **Step 4: Run compiler tests**
 
 ```bash
 cargo test -p aegis-rules --test compiler_test -- --nocapture
@@ -1432,14 +1428,15 @@ async fn watcher_detects_file_change() {
 
     let (watcher, mut rx) = RulesWatcher::new(file.path()).unwrap();
 
-    // Modify the file
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for inotify to register the watch before writing.
+    // 200ms is sufficient on most Linux kernels; on very slow CI increase to 500ms.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     writeln!(file, "# changed").unwrap();
-    file.flush().unwrap();
+    // std::fs::File is unbuffered at OS level — flush() is a no-op but harmless.
 
-    // Should receive a reload signal within 1s
-    let result = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
-    assert!(result.is_ok(), "Expected reload signal within 1s");
+    // Should receive a reload signal within 2s
+    let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+    assert!(result.is_ok(), "Expected reload signal within 2s — if flaky, increase sleep above");
 
     drop(watcher);
 }
@@ -1706,6 +1703,16 @@ impl EventKind {
             Self::Allow => "allow",
             Self::Alert => "alert",
             Self::Anomaly => "anomaly",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "block" => Some(Self::Block),
+            "allow" => Some(Self::Allow),
+            "alert" => Some(Self::Alert),
+            "anomaly" => Some(Self::Anomaly),
+            _ => None,
         }
     }
 }
@@ -2191,6 +2198,23 @@ fn query_events_by_severity() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].src_ip, "1.1.1.1");
 }
+
+#[test]
+fn event_kind_round_trips_through_db() {
+    let dir = TempDir::new().unwrap();
+    let mut conn = setup_db(&dir);
+    let writer = EventWriter::new();
+
+    // Insert an Allow event (not Block)
+    let allow_evt = Event { kind: EventKind::Allow, ..test_event("7.7.7.7") };
+    writer.insert(&mut conn, allow_evt).unwrap();
+
+    let query = EventQuery { limit: Some(10), ..Default::default() };
+    let results = writer.query(&conn, &query).unwrap();
+    assert_eq!(results.len(), 1);
+    // kind must round-trip correctly through the DB — not hardcoded to Block
+    assert_eq!(results[0].kind, EventKind::Allow);
+}
 ```
 
 - [ ] **Step 2: Implement `ring.rs`**
@@ -2390,7 +2414,7 @@ impl EventWriter {
                 id: Some(r.get(0)?),
                 ts: r.get(1)?,
                 severity: Severity::from_str(&r.get::<_, String>(2)?).unwrap_or(Severity::Info),
-                kind: EventKind::Block, // simplified; full mapping in production
+                kind: EventKind::from_str(&r.get::<_, String>(3)?).unwrap_or(EventKind::Block),
                 src_ip: r.get(4)?,
                 dst_ip: r.get(5)?,
                 src_port: r.get(6)?,
@@ -2774,6 +2798,12 @@ impl IpStatsCache {
     }
 
     /// Flush all in-memory stats to SQLite via UPSERT.
+    ///
+    /// **Concurrency note:** The iter→reset sequence is not atomic. Events recorded
+    /// between `self.map.iter()` and the counter reset will be silently lost.
+    /// Acceptable for a 30-second periodic flush (tiny window, aggregate stats only).
+    /// Production hardening: swap the DashMap atomically using `Arc::swap` or wrap
+    /// the flush in a `tokio::sync::Mutex` if strict accuracy is needed.
     pub fn flush(&self, conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
         for entry in self.map.iter() {
