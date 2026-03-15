@@ -12,6 +12,8 @@ Aegis is a Rust-based firewall for Linux (WSL-compatible) with commercial-grade 
 
 **Out of scope for this phase:** Web GUI, Windows native support, anti-DDoS, zone-based rules, application-aware filtering, eBPF/XDP engine.
 
+**Deferred to phase 2 (designed for but not built):** SIEM integration, per-flow PCAP capture.
+
 **Guiding principles:**
 - Ultra-stable, fast, and capable from day one
 - Every abstraction designed for future extension without rewrite
@@ -31,10 +33,10 @@ Aegis is a Rust-based firewall for Linux (WSL-compatible) with commercial-grade 
 │                 aegis-daemon (unprivileged user)     │
 │   gRPC server · orchestration · detection · storage │
 └──────────────────────────┬──────────────────────────┘
-                           │ Restricted IPC
+                           │ Unix socket IPC (see §4.5)
 ┌──────────────────────────▼──────────────────────────┐
 │           aegis-privileged (root)                    │
-│   Minimal code: nftables JSON API + NFQUEUE only    │
+│   Minimal code: nftables JSON API + NFQUEUE fd mgmt │
 └──────────────────────────┬──────────────────────────┘
                            │ nftables/NFQUEUE syscalls
 ┌──────────────────────────▼──────────────────────────┐
@@ -44,10 +46,8 @@ Aegis is a Rust-based firewall for Linux (WSL-compatible) with commercial-grade 
 ```
 
 The daemon is split into two processes:
-- **`aegis-privileged`** (root): minimal code surface, handles only kernel operations
+- **`aegis-privileged`** (root, `CAP_NET_ADMIN` + `CAP_NET_RAW`): minimal code surface, handles only kernel operations and fd passing
 - **`aegis-daemon`** (unprivileged `aegis` system user): all business logic, gRPC, detection, storage
-
-Clients never touch the kernel directly.
 
 ---
 
@@ -61,13 +61,13 @@ aegis/
 ├── buf.yaml                      # buf toolchain config
 ├── buf.gen.yaml                  # code generation config
 ├── crates/
-│   ├── aegis-core/               # FirewallBackend trait + nftables/NFQUEUE impl
+│   ├── aegis-core/               # FirewallBackend trait (interface only)
 │   ├── aegis-detection/          # anomaly detection pipeline
 │   ├── aegis-rules/              # rule model + TOML parser + hot reload
 │   ├── aegis-store/              # tiered event storage (SQLite + ring buffer)
 │   ├── aegis-proto/              # generated protobuf/gRPC code (tonic-build)
 │   ├── aegis-daemon/             # main daemon binary (unprivileged)
-│   ├── aegis-privileged/         # privileged binary (root, minimal)
+│   ├── aegis-privileged/         # privileged binary (root, minimal code)
 │   ├── aegis-tui/                # TUI client binary (ratatui + crossterm)
 │   └── aegis-cli/                # CLI client binary (clap v4)
 └── docs/
@@ -76,10 +76,11 @@ aegis/
 ```
 
 **Crate boundaries (enforced):**
-- Only `aegis-privileged` calls nftables/NFQUEUE
-- Only `aegis-proto` is shared between daemon and clients
-- `aegis-detection` never imports `aegis-core` directly
-- `aegis-daemon` and `aegis-privileged` communicate via a restricted IPC protocol (not gRPC)
+- `aegis-core` defines the `FirewallBackend` trait only — no implementation
+- `aegis-privileged` implements `FirewallBackend` and owns all kernel fd handles
+- `aegis-detection` never imports `aegis-core` or `aegis-privileged` directly
+- Only `aegis-proto` is shared between daemon and clients; no business logic crosses the gRPC boundary
+- `aegis-daemon` communicates with `aegis-privileged` exclusively via the IPC protocol in §4.5
 
 ---
 
@@ -88,37 +89,105 @@ aegis/
 ### 4.1 FirewallBackend Trait
 
 ```rust
+// In aegis-core (trait definition only — no implementation here)
+// Uses async-trait macro for dyn-safe async methods on stable Rust
+#[async_trait::async_trait]
 pub trait FirewallBackend: Send + Sync {
     async fn apply_ruleset(&self, ruleset: &Ruleset) -> Result<()>; // atomic batch
     async fn flush(&self) -> Result<()>;
     async fn list_active_rules(&self) -> Result<Vec<Rule>>;
 }
+
+// Implementation lives in aegis-privileged, not aegis-core:
+// struct NftablesBackend { ... }
+// impl FirewallBackend for NftablesBackend { ... }
 ```
 
-The trait is the eBPF swap boundary. The nftables implementation lives entirely inside `aegis-privileged`. Future Aya/eBPF implementation replaces only this crate's internals.
+**Note on async traits:** `async fn` in traits requires either `async-trait` (proc-macro, works with `dyn`) or AFIT + `#[trait_variant::make]`. Use `async-trait` for now; it supports `dyn FirewallBackend + Send + Sync` cleanly. AFIT has `dyn` limitations until Rust stabilizes return-position impl trait in traits.
 
-### 4.2 Rule Application — Atomic via nftables JSON API
+The trait is the eBPF swap boundary. Future Aya/eBPF backend implements this trait; daemon code is unchanged.
+
+### 4.2 Rule Application — Atomic via nftables
 
 Rules are never applied one-by-one. Every apply is a single atomic nftables transaction:
 
 ```
-nft flush ruleset + add all rules = single atomic batch via nft -j -f <json_file>
-Success → all rules applied. Failure → kernel rejects entire batch, old rules intact.
+nft -j -f <json_file>  →  atomic: all rules applied or none
+Success → entire ruleset active. Failure → kernel rejects batch, old rules intact.
 ```
 
-Uses the `nftables` crate (JSON API mode) — no raw subprocess string building, no C FFI.
+**Implementation:** Use `tokio::process::Command` to invoke `nft -j -f <tmpfile>` with a JSON ruleset file. Do not use any `nftables` crate from crates.io — existing crates have maintenance concerns. Generate nftables JSON directly from the `Ruleset` type using `serde_json`. The JSON schema is stable and documented in the nftables project.
 
-### 4.3 NFQUEUE — Pure Rust
+### 4.3 NFQUEUE — Packet Interception
 
 Uses `nfq` crate (pure Rust netlink-based NFQUEUE, no libnetfilter_queue C dependency).
 
-NFQUEUE listener runs as an async task, pushes `RawPacket` via crossbeam channel to the detection pipeline. Verdicts (ACCEPT/DROP/REJECT) are returned via a separate verdict channel.
+**Critical:** `nfq` is a synchronous blocking library. It must NOT be called directly from a tokio async task (blocks executor thread). Use a dedicated OS thread:
+
+```rust
+// In aegis-privileged: dedicated NFQUEUE thread
+let (packet_tx, packet_rx) = crossbeam_channel::bounded(4096);
+let (verdict_tx, verdict_rx) = crossbeam_channel::bounded(4096);
+
+std::thread::spawn(move || {
+    let mut queue = nfq::Queue::open().unwrap();
+    queue.bind(QUEUE_NUM).unwrap();
+    loop {
+        let msg = queue.recv().unwrap();         // blocking, safe in OS thread
+        packet_tx.send(RawPacket::from(&msg)).unwrap();
+        let verdict = verdict_rx.recv().unwrap();
+        msg.set_verdict(verdict);
+    }
+});
+// packet_rx forwarded to aegis-daemon via IPC (§4.5)
+// verdict_tx receives verdicts from aegis-daemon via IPC (§4.5)
+```
 
 ### 4.4 Packet Flow
 
 ```
-Kernel (nftables) → NFQUEUE → crossbeam channel → Detection pipeline → verdict → Kernel
+Kernel (nftables) → NFQUEUE → OS thread (aegis-privileged)
+  → IPC socket → aegis-daemon → Detection pipeline (rayon)
+  → verdict → IPC socket → aegis-privileged OS thread → Kernel
 ```
+
+### 4.5 IPC Protocol: aegis-privileged ↔ aegis-daemon
+
+**Transport:** Unix domain socket at `/run/aegis/priv.sock` (created by `aegis-privileged`, permissions `0600`, owned by root, group `aegis`). `aegis-daemon` connects as the `aegis` user.
+
+**Wire format:** Length-prefixed binary frames using `bincode` (deterministic, fast, no schema evolution needed for internal IPC). Each frame:
+
+```
+[u32 length LE][bincode-encoded IpcMessage]
+```
+
+**Message types:**
+
+```rust
+#[derive(Serialize, Deserialize)]
+enum IpcMessage {
+    // privileged → daemon
+    Packet { id: u32, data: Vec<u8>, timestamp: u64 },
+    RuleApplyAck { success: bool, error: Option<String> },
+
+    // daemon → privileged
+    Verdict { id: u32, verdict: NfqVerdict },           // ACCEPT | DROP | REJECT
+    ApplyRuleset { json: String },                      // nftables JSON blob
+    Flush,
+}
+```
+
+**Authentication:** The socket is filesystem-permission-controlled. Only the `aegis` user and root can connect. No additional auth required for this internal channel.
+
+**Crash recovery:** `aegis-daemon` monitors the IPC socket with a 1s keepalive ping. If `aegis-privileged` dies:
+- `aegis-daemon` logs `CRIT: privileged process lost` to syslog and systemd journal
+- Daemon **fails closed**: immediately flushes all NFQUEUE verdicts to `DROP`, nftables ruleset remains as-is (last applied state) — the kernel enforces existing rules even without the daemon
+- Daemon emits a gRPC `SystemStatus` event so TUI/CLI can alert the operator
+- Systemd `Restart=on-failure` restarts `aegis-privileged`; daemon reconnects automatically
+
+**Hot reload vs. Apply race:** If a TOML hot reload fires while a gRPC `Apply` + rollback timer is active:
+- Hot reload is rejected with `BUSY` status; the inotify handler re-queues and retries after the active Apply completes or rolls back
+- Only one ruleset modification path is active at a time — enforced by a `tokio::sync::Mutex<RulesetState>`
 
 ---
 
@@ -126,112 +195,169 @@ Kernel (nftables) → NFQUEUE → crossbeam channel → Detection pipeline → v
 
 ### 5.1 Architecture
 
-The detection pipeline is **synchronous on rayon thread pool** (CPU-bound), decoupled from the async I/O layer via crossbeam channels:
+Detection is **synchronous on rayon thread pool** (CPU-bound), bridged from async via crossbeam:
 
 ```
-Packet (NFQUEUE, tokio async)
-  → crossbeam channel
-    → Decoder (rayon) — parse L2/L3/L4, zero-copy via bytes::Bytes
-      → Stream reassembly (per-flow TCP buffer)
-        → Detection engine (rayon) — runs all detectors, aggregates score
-          → Verdict → NFQUEUE (async)
-          → Alert → SQLite writer (async, batched)
-          → Metrics → Prometheus atomics
+Packet (IPC from aegis-privileged → crossbeam channel, async bridge)
+  → Decoder (rayon) — parse L2/L3/L4, zero-copy via bytes::Bytes
+    → Stream reassembly (per-flow TCP buffer, keyed by FlowKey)
+      → Detection engine (rayon) — all detectors, score aggregation
+        → Verdict → crossbeam → IPC → aegis-privileged → Kernel
+        → Alert → async channel → SQLite batch writer
+        → Metrics → atomic counters (Prometheus)
 ```
 
 ### 5.2 Detector Trait (Sync)
 
 ```rust
-pub trait Detector: Send + Sync {
-    fn name(&self) -> &str;
-    fn inspect(&self, packet: &DecodedPacket, flow: &FlowState, ctx: &DetectionContext) -> DetectorResult;
+#[derive(Debug)]
+pub struct BlockReason {
+    pub code: &'static str,      // stable machine-readable code e.g. "port_scan"
+    pub description: String,     // human-readable detail
+}
+
+#[derive(Debug)]
+pub struct DetectionEvent {
+    pub detector: &'static str,
+    pub severity: Severity,
+    pub reason: BlockReason,
+    pub metadata: serde_json::Value,
 }
 
 pub struct DetectorResult {
-    pub score: u8,              // 0–100 risk contribution
+    pub score: u8,                       // 0–100 risk contribution
     pub reason: Option<BlockReason>,
     pub event: Option<DetectionEvent>,
 }
+
+pub trait Detector: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn weight(&self) -> f32;             // contribution weight for aggregation
+    fn inspect(&self, packet: &DecodedPacket, flow: &FlowState, ctx: &DetectionContext) -> DetectorResult;
+}
 ```
 
-### 5.3 Confidence Scoring
+### 5.3 Confidence Scoring & Aggregation
 
-Detectors run in order, each contributing a weighted risk score (0–100). Final verdict is based on configurable thresholds:
+Each detector returns a `score` (0–100) and a `weight`. Final risk score is a **weighted average**:
 
 ```
-score >= 70  → Block
-score 40–69  → Log + Monitor
-score < 40   → Allow
+final_score = sum(score_i * weight_i) / sum(weight_i)
 ```
 
-Thresholds are configurable per-deployment in TOML.
+Scores are capped at 100. Default thresholds (configurable in TOML):
+
+```
+final_score >= 70  → Block
+final_score 40–69  → Log + Monitor (allow but record)
+final_score < 40   → Allow
+```
+
+Default detector weights:
+
+| Detector | Weight |
+|---|---|
+| SynFloodDetector | 2.0 |
+| PortScanDetector | 1.5 |
+| IpReputationDetector | 1.5 |
+| RateLimiter | 1.0 |
+| GeoBlockDetector | 1.0 |
+| ProtocolAnomalyDetector | 1.2 |
+| DpiDetector | 1.8 |
 
 ### 5.4 Detectors at Launch
 
 | Detector | Method |
 |---|---|
-| `PortScanDetector` | Sliding window counter per src IP, Aho-Corasick pattern match |
-| `SynFloodDetector` | SYN/ACK ratio tracking via flow table |
-| `RateLimiter` | Token bucket algorithm per src IP |
-| `IpReputationDetector` | Local blocklists, auto-updated via background task |
-| `GeoBlockDetector` | MaxMind GeoLite2 via `maxminddb` crate, auto-updated |
-| `ProtocolAnomalyDetector` | Validates packet structure vs. declared protocol |
-| `DpiDetector` | Aho-Corasick multi-pattern matching on reassembled TCP streams |
+| `PortScanDetector` | Sliding window (per src IP): tracks distinct dst ports contacted within time window; triggers on threshold |
+| `SynFloodDetector` | Per-flow SYN/ACK ratio tracking; triggers when SYN count >> ACK count above threshold |
+| `RateLimiter` | Token bucket algorithm per src IP; configurable rate + burst |
+| `IpReputationDetector` | Checks src IP against local blocklists loaded into `HashSet<IpAddr>` at startup + background refresh |
+| `GeoBlockDetector` | MaxMind GeoLite2 via `maxminddb` crate; country-level block list from TOML config |
+| `ProtocolAnomalyDetector` | Validates packet structure and flags vs. declared protocol |
+| `DpiDetector` | Aho-Corasick multi-pattern matching on reassembled TCP streams; patterns loaded from TOML config |
+
+**Note:** Aho-Corasick (`aho-corasick` crate) is used only in `DpiDetector` for payload pattern matching. Port scan detection is purely statistical (sliding window counters), not string matching.
 
 ### 5.5 Flow Table
 
 ```rust
-// DashMap<FlowKey, FlowState> with LRU eviction
 // FlowKey = (src_ip, dst_ip, src_port, dst_port, proto)
-// FlowState = SynSent | Established | FinWait | Closed + metadata + score history
+// FlowState = { tcp_state, syn_count, ack_count, last_seen, score_history, ... }
 ```
 
-- Integrates with kernel `nf_conntrack` via netlink (reads existing state, supplements with app-layer data)
-- Memory-bounded: configurable max entries with LRU eviction — prevents OOM under adversarial traffic
-- Per-IP state in separate `DashMap<IpAddr, IpState>` — also LRU-bounded
+**LRU eviction:** Use `moka` crate (`moka::sync::Cache`) — thread-safe, concurrent, LRU-with-TTL, production-grade (used by Datafusion, TiKV). Wrap with `DashMap` is unnecessary; `moka` provides its own concurrent access.
+
+```rust
+let flow_table: Cache<FlowKey, FlowState> = Cache::builder()
+    .max_capacity(config.flow_table_max_entries)  // configurable, default 500_000
+    .time_to_idle(Duration::from_secs(120))
+    .build();
+```
+
+Reads kernel `nf_conntrack` state via netlink on flow creation to initialize TCP state. Userspace flow state supplements (app-layer, scoring history), does not replace kernel conntrack.
 
 ### 5.6 DPI — Aho-Corasick Pattern Engine
 
-Patterns defined in TOML, compiled into an Aho-Corasick automaton at startup (`aho-corasick` crate). Same algorithm as Snort/Suricata. Applied only to reassembled TCP streams (not raw packets).
+Patterns defined in TOML config file (`/etc/aegis/dpi-patterns.toml`), compiled into an Aho-Corasick automaton at startup. Applied only to reassembled TCP streams after `pnet`/`etherparse` decoding. Zero-copy via `bytes::Bytes` throughout.
 
 ### 5.7 Threat Intelligence Updates
 
-Background async task runs on configurable schedule (default: every 6 hours):
-- Pull updated IP blocklists (Emerging Threats, Spamhaus)
-- Pull updated GeoLite2 database
-- Hot-reload into running detectors without restart
+Background async task (tokio) on configurable schedule (default: every 6 hours):
+- Pull updated IP blocklists (Emerging Threats, Spamhaus DROP list)
+- Pull updated GeoLite2 database (requires license key — see §12.3)
+- Atomically hot-swap loaded data via `Arc<RwLock<ThreatIntel>>`; no restart required
+
+Manual trigger: `aegis update signatures` CLI command sends `UpdateSignatures` RPC → daemon triggers background task immediately → returns when update completes or fails with structured error.
+
+Storage location: `/var/lib/aegis/threat-intel/` (created on install, owned by `aegis` user, permissions `0750`).
 
 ---
 
 ## 6. `aegis-rules` — Rule Model & Storage
 
-### 6.1 Rule Type
+### 6.1 Rule Types
 
 ```rust
 pub struct Rule {
-    pub id: RuleId,
-    pub priority: u32,
+    pub id: RuleId,              // UUID string
+    pub priority: u32,           // lower = evaluated first; range 0–65535
     pub name: String,
     pub enabled: bool,
-    pub matches: Vec<Match>,    // all must match (AND)
+    pub matches: Vec<Match>,     // all must match (AND semantics)
     pub action: Action,
     pub log: bool,
+}
+
+pub enum Direction {
+    Inbound,    // traffic destined for this host
+    Outbound,   // traffic originating from this host
+    Forward,    // traffic routed through this host
 }
 
 pub enum Match {
     SrcIp(IpNet),
     DstIp(IpNet),
-    SrcPort(PortRange),
+    SrcPort(PortRange),          // PortRange = single port or inclusive range
     DstPort(PortRange),
-    Protocol(Protocol),
-    Direction(Direction),       // extensible for future zone/app-aware modes
+    Protocol(Protocol),          // Tcp | Udp | Icmp | Any
+    Direction(Direction),
+    // Future: Zone(ZoneId), Application(AppId) — added here without breaking existing rules
+}
+
+pub struct RateLimitPolicy {
+    pub rate: u32,               // tokens per second (packets or bytes, see unit field)
+    pub burst: u32,              // maximum burst size
+    pub unit: RateLimitUnit,     // Packets | Bytes
+    pub scope: RateLimitScope,   // PerSrcIp | PerConnection | Global
+    pub on_exceed: ExceedAction, // Drop | Reject | Log
 }
 
 pub enum Action {
     Allow,
     Block,
-    Reject,
-    Log,
+    Reject,                      // Block + send RST (TCP) or ICMP unreachable (UDP)
+    Log,                         // pass but record to event store
     RateLimit(RateLimitPolicy),
 }
 ```
@@ -240,7 +366,7 @@ pub enum Action {
 
 ```toml
 [[rules]]
-id = "allow-ssh"
+id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 priority = 10
 name = "Allow SSH from trusted subnet"
 enabled = true
@@ -258,15 +384,39 @@ log = false
   [[rules.matches]]
   type = "protocol"
   value = "tcp"
+
+  [[rules.matches]]
+  type = "direction"
+  value = "inbound"
+
+[[rules]]
+id = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+priority = 20
+name = "Rate limit HTTP"
+enabled = true
+log = true
+
+  [rules.action]
+  type = "rate_limit"
+  rate = 100
+  burst = 200
+  unit = "packets"
+  scope = "per_src_ip"
+  on_exceed = "drop"
 ```
 
 ### 6.3 Rule Engine Behaviours
 
-- Rules sorted by priority at load, compiled to ordered vec
-- **Hot reload**: `inotify` watch on TOML file, atomic reload without restart
-- **Validation**: conflict detection, shadowed rules, invalid CIDRs — errors surfaced to TUI/CLI
-- **Rollback guard**: `Apply` starts a countdown timer; if `Confirm` not received within deadline, auto-revert to previous ruleset
-- **Dry-run**: translate rules to nftables JSON diff without calling `aegis-core`
+- Rules sorted by priority at load, compiled to ordered `Vec<Rule>`
+- **Hot reload:** `inotify` watch on `/etc/aegis/rules.toml`; hot reload is blocked while a gRPC `Apply` + rollback timer is active (enforced by `tokio::sync::Mutex<RulesetState>`)
+- **Validation:** conflict detection, shadowed rules, invalid CIDRs, out-of-range priorities — errors returned via gRPC with structured `BadRequest` details
+- **Rollback guard:**
+  - `Apply` RPC acquires `RulesetState` lock, applies new ruleset, stores `previous_ruleset` snapshot, starts a `tokio::time::sleep(deadline)` task
+  - Default deadline: 60 seconds (configurable in TOML and overridable per `Apply` call)
+  - If `ConfirmApply` RPC received before deadline: cancels sleep task, releases lock, commits
+  - If deadline expires (no confirm): auto-reverts to `previous_ruleset`, releases lock, logs `WARN: rollback triggered`
+  - If daemon crashes during window: `aegis-privileged` retains last-applied nftables ruleset (kernel holds it); on restart, daemon reads active rules from nftables and marks state as unconfirmed
+- **Dry-run:** translate rules to nftables JSON diff without IPC call to `aegis-privileged`; returns diff as structured response
 
 ---
 
@@ -275,28 +425,45 @@ log = false
 ### 7.1 Tiered Storage Architecture
 
 ```
-Detection Engine
+Detection Engine (aegis-daemon)
       │
       ▼
 ┌─────────────────────────────┐
-│  Hot tier: Memory ring      │  Lock-free ring buffer (ringbuf crate)
-│  buffer                     │  Last 50k events — instant TUI live feed
+│  Hot tier: Memory ring      │  ringbuf crate (lock-free SPSC/MPSC)
+│  buffer — last 50k events   │  TUI live feed reads from here directly
 └──────────────┬──────────────┘
-               │ Batch flush (500 events or 100ms, whichever first)
+               │ Async batch flush (500 events OR 100ms, whichever first)
                ▼
 ┌─────────────────────────────┐
-│  Warm tier: SQLite          │  Days/weeks of queryable history
-│  (SQLCipher + WAL + FTS5)   │
+│  Warm tier: SQLite          │  sqlx + SQLCipher + WAL + FTS5
+│  Days/weeks of history      │  1 writer conn + N reader conns
 └──────────────┬──────────────┘
-               │ Nightly rotation + zstd compression
+               │ Nightly rotation (configurable: age or size threshold)
                ▼
 ┌─────────────────────────────┐
-│  Cold tier: .db.zst files   │  Months of history, forensics
+│  Cold tier: .db.zst files   │  zstd-compressed SQLite snapshots
+│  /var/lib/aegis/archive/    │  Read-only; decompressed to tmpfile on query
 └─────────────────────────────┘
 ```
 
+**Cold tier rotation trigger:** rotate when warm DB exceeds 1GB or 30 days old (configurable). Background task runs nightly at 02:00. Cold files are named `events-YYYY-MM-DD.db.zst`. Querying cold tier: daemon decompresses to `$TMPDIR/aegis-cold-<hash>.db`, opens read-only, closes + deletes tmpfile when query completes.
+
 ### 7.2 SQLite Configuration
 
+**SQLCipher integration:** `sqlx` does not support SQLCipher natively. Use `rusqlite` (which has first-class SQLCipher support via the `bundled-sqlcipher` feature) wrapped in an async-compatible pool. Do NOT use `sqlx` with SQLCipher — the linker complexity is unacceptable. Use `rusqlite` + `tokio::task::spawn_blocking` for all DB calls, or `deadpool` for connection pooling.
+
+```rust
+// Cargo.toml
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
+```
+
+Key derivation: SQLCipher key derived via Argon2id from a machine secret (see §12.3). Applied as:
+```sql
+PRAGMA key = '<hex-encoded-key>';
+PRAGMA cipher_page_size = 4096;
+```
+
+Additional PRAGMAs applied on every connection:
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -304,22 +471,26 @@ PRAGMA cache_size = -65536;       -- 64MB page cache
 PRAGMA mmap_size = 268435456;     -- 256MB memory-mapped I/O
 PRAGMA temp_store = MEMORY;
 PRAGMA wal_autocheckpoint = 1000;
-PRAGMA page_size = 4096;
+PRAGMA foreign_keys = ON;
 ```
 
-- **Encryption at rest**: SQLCipher with AES-256, key derived via Argon2 from machine secret
-- **Connection pool**: 1 dedicated writer + N readers via `sqlx::SqlitePool`
-- **Schema migrations**: `sqlx migrate` with versioned migration files
-- **Integrity check**: `PRAGMA integrity_check` + HMAC chain verification on every daemon start
+**Connection model:** 1 dedicated writer thread (blocking, `spawn_blocking`) + read pool (configurable, default 4 reader threads). Writes are serialized via a channel to the writer thread.
+
+**Schema migrations:** `rusqlite_migration` crate with versioned migration structs checked into `crates/aegis-store/migrations/`. Run on every daemon start before accepting connections.
+
+**Startup integrity check:**
+1. `PRAGMA integrity_check` — abort if not "ok"
+2. HMAC chain verification on `audit_log` table (see §7.3)
+3. If either fails: log to syslog + systemd journal with details; daemon refuses to start
 
 ### 7.3 Schema
 
 ```sql
 CREATE TABLE events (
     id          INTEGER PRIMARY KEY,
-    ts          INTEGER NOT NULL,
-    severity    TEXT NOT NULL,     -- info|low|medium|high|critical
-    kind        TEXT NOT NULL,     -- block|allow|alert|anomaly
+    ts          INTEGER NOT NULL,       -- Unix ms
+    severity    TEXT NOT NULL CHECK(severity IN ('info','low','medium','high','critical')),
+    kind        TEXT NOT NULL CHECK(kind IN ('block','allow','alert','anomaly')),
     src_ip      TEXT NOT NULL,
     dst_ip      TEXT NOT NULL,
     src_port    INTEGER,
@@ -327,55 +498,82 @@ CREATE TABLE events (
     protocol    TEXT,
     rule_id     TEXT,
     detector    TEXT,
-    score       INTEGER,
-    reason      TEXT,
-    hit_count   INTEGER DEFAULT 1, -- deduplication
+    score       INTEGER CHECK(score BETWEEN 0 AND 100),
+    hit_count   INTEGER NOT NULL DEFAULT 1,   -- deduplication counter
     first_seen  INTEGER NOT NULL,
     last_seen   INTEGER NOT NULL,
-    raw_meta    TEXT               -- JSON for extensibility
+    reason_code TEXT,                         -- stable machine-readable code
+    reason_desc TEXT,                         -- human-readable detail
+    raw_meta    TEXT                          -- JSON for extensibility
 );
 
-CREATE INDEX idx_events_ts     ON events(ts);
-CREATE INDEX idx_events_src_ip ON events(src_ip);
-CREATE INDEX idx_events_kind   ON events(kind);
+CREATE INDEX idx_events_ts       ON events(ts DESC);
+CREATE INDEX idx_events_src_ip   ON events(src_ip);
+CREATE INDEX idx_events_severity ON events(severity);
+CREATE INDEX idx_events_kind     ON events(kind);
 
+-- FTS5 with content table + sync triggers
 CREATE VIRTUAL TABLE events_fts USING fts5(
-    reason, detector, src_ip, dst_ip,
-    content='events', content_rowid='id'
+    reason_desc, detector, src_ip, dst_ip,
+    content='events',
+    content_rowid='id'
 );
 
--- Tamper-evident audit log (never deleted, HMAC-chained)
+CREATE TRIGGER events_fts_insert AFTER INSERT ON events BEGIN
+    INSERT INTO events_fts(rowid, reason_desc, detector, src_ip, dst_ip)
+    VALUES (new.id, new.reason_desc, new.detector, new.src_ip, new.dst_ip);
+END;
+CREATE TRIGGER events_fts_delete AFTER DELETE ON events BEGIN
+    INSERT INTO events_fts(events_fts, rowid, reason_desc, detector, src_ip, dst_ip)
+    VALUES ('delete', old.id, old.reason_desc, old.detector, old.src_ip, old.dst_ip);
+END;
+CREATE TRIGGER events_fts_update AFTER UPDATE ON events BEGIN
+    INSERT INTO events_fts(events_fts, rowid, reason_desc, detector, src_ip, dst_ip)
+    VALUES ('delete', old.id, old.reason_desc, old.detector, old.src_ip, old.dst_ip);
+    INSERT INTO events_fts(rowid, reason_desc, detector, src_ip, dst_ip)
+    VALUES (new.id, new.reason_desc, new.detector, new.src_ip, new.dst_ip);
+END;
+
+-- Tamper-evident audit log (never deleted, append-only)
 CREATE TABLE audit_log (
     id          INTEGER PRIMARY KEY,
     ts          INTEGER NOT NULL,
-    actor       TEXT NOT NULL,     -- cert CN of caller
-    action      TEXT NOT NULL,
-    detail      TEXT,
-    prev_hash   TEXT NOT NULL,
-    entry_hmac  TEXT NOT NULL
+    actor       TEXT NOT NULL,          -- cert CN of caller (or "system")
+    action      TEXT NOT NULL,          -- e.g. "rule.create", "rule.apply", "daemon.start"
+    target_id   TEXT,                   -- affected resource ID if applicable
+    detail      TEXT,                   -- JSON blob of change details
+    prev_hash   TEXT NOT NULL,          -- SHA-256 of previous row's entry_hmac
+    entry_hmac  TEXT NOT NULL           -- HMAC-SHA256(prev_hash || ts || actor || action || detail)
 );
+-- audit_log has no DELETE trigger and no retention policy
 ```
+
+**Audit HMAC specification:**
+- Algorithm: HMAC-SHA256
+- Key: audit HMAC key from key management (§12.3), distinct from SQLCipher key
+- Input: `prev_hash || "|" || ts_string || "|" || actor || "|" || action || "|" || detail`
+- First row `prev_hash`: SHA-256 of the daemon's installation UUID (set on first run)
+- Chain verification: re-compute HMAC for every row on startup; abort if any mismatch
 
 ### 7.4 Additional Storage Features
 
-- **Event deduplication**: same `(src_ip, dst_ip, dst_port, reason)` within time window → increment `hit_count`, update `last_seen`
-- **In-memory `ip_stats`**: `DashMap<IpAddr, IpStats>` flushed to SQLite every 30s — detectors read from memory
-- **PCAP capture on critical alerts**: ring buffer of last N packets per flow stored as `.pcap` for forensics
-- **Retention policy**: configurable max age + max rows, background vacuum nightly
-- **Startup integrity check**: verify HMAC chain, refuse to start if tampered
+**Event deduplication:** Before inserting, check for existing row with matching `(src_ip, dst_ip, dst_port, reason_code)` within the last 60 seconds (configurable). If found: `UPDATE SET hit_count = hit_count + 1, last_seen = ?` instead of insert.
 
-### 7.5 SIEM Integration
+**In-memory ip_stats:** `DashMap<IpAddr, IpStats>` (total packets, blocked count, alert count, rolling risk score) flushed to a separate `ip_stats` SQLite table every 30 seconds via `spawn_blocking`. Detectors read from memory only.
 
+**PCAP capture (phase 2):** Designed for but not implemented in phase 1. When implemented: `.pcap` files stored in `/var/lib/aegis/pcap/` (permissions `0700`, owned by `aegis` user, never world-readable), rotated at 100MB per file, max 10GB total, cleaned by retention policy. SQLCipher-encrypted at rest using the same key derivation as the event DB.
+
+**Retention policy:** Configurable `max_age_days` (default: 90) and `max_rows` (default: 10M). Background vacuum runs nightly; deletes oldest events first. Audit log is exempt from retention.
+
+### 7.5 SIEM Integration (Phase 2)
+
+Designed for but deferred to phase 2. Config stub reserved in TOML:
 ```toml
-[siem]
-enabled = true
-protocol = "tcp+tls"
-host = "siem.internal:6514"
-format = "cef"                 # cef | leef | json-eve | syslog-rfc5424
-min_severity = "medium"
+# [siem]  # Phase 2 — uncomment when implemented
+# enabled = false
 ```
 
-Syslog RFC 5424 + CEF/LEEF/Eve-JSON output. Background async task forwards events matching `min_severity`.
+When implemented: syslog RFC 5424 + CEF/LEEF/Eve-JSON output over TCP+TLS to external SIEM (Splunk, QRadar, Graylog).
 
 ---
 
@@ -387,37 +585,103 @@ Syslog RFC 5424 + CEF/LEEF/Eve-JSON output. Background async task forwards event
 aegis-privileged (root)          aegis-daemon (aegis user)
   CAP_NET_ADMIN                    No elevated capabilities
   CAP_NET_RAW                      All business logic
-  Minimal code surface             gRPC, detection, storage
-  Only kernel ops                  Communicates up via IPC
+  ~200 lines of code               gRPC, detection, storage
+  Only kernel ops + IPC            Communicates via /run/aegis/priv.sock
 ```
+
+`aegis-privileged` is designed to be auditable by anyone in under 30 minutes. The small code surface is the point.
 
 ### 8.2 Linux Hardening
 
-- **Capabilities**: `CAP_NET_ADMIN` + `CAP_NET_RAW` only, dropped via `capctl`/`prctl` at startup
-- **Seccomp-BPF**: whitelist of allowed syscalls via `seccompiler` crate; anything else → `SIGSYS`
-- **Systemd unit hardening**: `NoNewPrivileges=true`, `ProtectSystem=strict`, `PrivateTmp=true`, `RestrictSyscalls`, `AmbientCapabilities`
+**Capabilities:** Both processes drop all capabilities except what is needed. `aegis-privileged` retains `CAP_NET_ADMIN` + `CAP_NET_RAW` via systemd `AmbientCapabilities`. Both processes call `prctl(PR_SET_NO_NEW_PRIVS, 1)` immediately on startup.
+
+**Seccomp-BPF (`seccompiler` crate):**
+- `aegis-privileged` whitelist: `read`, `write`, `sendmsg`, `recvmsg`, `socket`, `bind`, `accept`, `close`, netlink family only
+- `aegis-daemon` whitelist: standard POSIX I/O, network (TCP only, no raw sockets), futex, mmap, clock — explicitly excludes `ptrace`, `kexec_load`, `perf_event_open`
+
+**Systemd unit (`/lib/systemd/system/aegis.service`):**
+```ini
+[Service]
+User=aegis
+Group=aegis
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictSyscalls=@basic-io @network-io @system-service
+AmbientCapabilities=              # aegis-daemon: none
+# aegis-privileged has separate unit with CAP_NET_ADMIN CAP_NET_RAW
+SystemCallFilter=~@debug @mount @cpu-emulation @obsolete
+Restart=on-failure
+RestartSec=2s
+```
 
 ### 8.3 gRPC Security
 
-- **mTLS**: daemon generates local CA + client certs on first run; all clients must present valid cert
-- **RBAC via cert CN**: roles encoded in certificate CN
-  - `admin` — full access
-  - `operator` — read + unblock, no rule changes
-  - `monitor` — read-only
-  - `ci` — dry-run only
-- **Interceptor chain**: `AuthInterceptor → RateLimitInterceptor → TracingInterceptor → AuditInterceptor → Handler`
-- **Load shedding**: priority tiers via `tower::load_shed()` + semaphore
-  - P1 (never shed): `ConfirmApply`, `GetHealth`
-  - P2: `CreateRule`, `Apply`, `UnblockIp`
-  - P3 (shed first): `QueryEvents`, `ExportEvents`, `StreamEvents`
+**Socket path and permissions:**
+- gRPC Unix socket: `/run/aegis/mgmt.sock`
+- Permissions: `0660`, owner `root`, group `aegis`
+- TUI and CLI must run as `aegis` group or root to connect
 
-### 8.4 Startup Integrity
+**mTLS:**
+- On first run: daemon generates local CA (`/etc/aegis/pki/ca.crt` + `ca.key`), admin client cert (`admin.crt` + `admin.key`)
+- CA key: permissions `0600`, owned by root
+- Client certs: permissions `0640`, group `aegis`
+- Cert validity: 1 year for client certs, 10 years for CA cert
+- Rotation: `aegis pki rotate-client --role <role>` generates new cert, old cert valid until expiry
+- No CRL in phase 1 — cert expiry is the revocation mechanism; short validity period is intentional
+- mTLS enforced by tonic; unauthenticated connections are rejected at TLS handshake
 
-On every start:
-1. Verify SQLite HMAC chain continuity
-2. Verify config TOML checksum
-3. `PRAGMA integrity_check` on database
-4. Refuse to start if tampered, log to system journal
+**RBAC via cert CN:**
+```
+CN=aegis-admin    → all RPCs
+CN=aegis-operator → read + unblock + block; no CreateRule/DeleteRule/Apply
+CN=aegis-monitor  → read-only RPCs only
+CN=aegis-ci       → DryRun only
+```
+`AuthInterceptor` extracts CN from peer certificate, maps to role, checks against per-RPC permission table. Unknown CN → `PERMISSION_DENIED`.
+
+**Interceptor chain:**
+```
+AuthInterceptor → RateLimitInterceptor → TracingInterceptor → AuditInterceptor → Handler
+```
+
+**Rate limits (per authenticated client, per minute):**
+- Destructive mutations (DeleteRule, Apply, UnblockIp): 10/min
+- Non-destructive mutations (CreateRule, UpdateRule): 60/min
+- Reads (ListRules, QueryEvents): 600/min
+- Streaming (ManageSession): 5 concurrent sessions per client
+- Exceeded → `RESOURCE_EXHAUSTED` with `RetryInfo` delay hint
+
+**Load shedding via `tower::load_shed` + semaphore:**
+- P1 (never shed): `ConfirmApply`, `GetHealth`, `grpc.health.v1.Health/Check`
+- P2 (shed under pressure): `CreateRule`, `Apply`, `UnblockIp`, `UpdateDetector`
+- P3 (shed first): `QueryEvents`, `ExportEvents`, `ManageSession`
+
+### 8.4 Secret & Key Management
+
+All secrets stored at `/etc/aegis/secrets/` (permissions `0700`, owned by root):
+
+| File | Contents | Permission |
+|---|---|---|
+| `machine.key` | 32-byte random machine secret (generated on install) | `0600` root |
+| `pki/ca.key` | CA private key | `0600` root |
+| `pki/ca.crt` | CA certificate | `0644` |
+| `pki/<role>.key` | Client private key per role | `0640` root:aegis |
+| `pki/<role>.crt` | Client certificate per role | `0644` |
+
+**Key derivation:**
+```
+machine.key (32 bytes, random)
+  → Argon2id(machine.key, salt="aegis-db-v1", m=65536, t=3, p=4) → SQLCipher key (32 bytes)
+  → Argon2id(machine.key, salt="aegis-audit-v1", m=65536, t=3, p=4) → Audit HMAC key (32 bytes)
+```
+
+**GeoLite2 license key:** Stored in `/etc/aegis/secrets/geolite2.key` (plaintext, `0640` root:aegis). Configured during install via `aegis setup` command; never stored in TOML (which may be world-readable).
+
+**No keyring integration in phase 1.** Phase 2: integrate with Linux kernel keyring (`keyctl`) or systemd credentials.
 
 ---
 
@@ -426,9 +690,9 @@ On every start:
 ### 9.1 Toolchain
 
 - **`buf`**: linting (`buf lint`), breaking change detection (`buf breaking` in CI), code generation (`buf generate`)
-- **`protovalidate`**: field-level validation in proto definitions
+- **`protovalidate`**: field-level validation at request-handling time (NOT codegen only). Dependency: `protovalidate` Rust crate + CEL runtime. Added to Section 14 dependencies.
 - **`tonic`**: Rust gRPC implementation
-- **`tonic-web`**: enabled from day one for future web GUI (browser gRPC-Web compatibility)
+- **`tonic-web`**: added as a no-op stub (one line in server config, zero active functionality); activates only when web GUI is built in phase 2
 - **`tonic_reflection`**: enabled for `grpcurl`, Postman, debugging
 
 ### 9.2 Services
@@ -437,18 +701,51 @@ On every start:
 syntax = "proto3";
 package aegis.v1;
 
+import "google/protobuf/field_mask.proto";
+import "google/rpc/status.proto";
+import "google/rpc/error_details.proto";
+import "buf/validate/validate.proto";
+
+// ── Rule Management ───────────────────────────────────────
 service RuleService {
   rpc ListRules     (ListRulesRequest)   returns (ListRulesResponse);
   rpc GetRule       (GetRuleRequest)     returns (Rule);
   rpc CreateRule    (CreateRuleRequest)  returns (Rule);
-  rpc UpdateRule    (UpdateRuleRequest)  returns (Rule);  // uses FieldMask
+  rpc UpdateRule    (UpdateRuleRequest)  returns (Rule);
   rpc DeleteRule    (DeleteRuleRequest)  returns (Empty);
   rpc ReorderRules  (ReorderRequest)     returns (Empty);
   rpc DryRun        (DryRunRequest)      returns (DryRunResponse);
-  rpc Apply         (ApplyRequest)       returns (ApplyResponse);  // starts rollback timer
-  rpc ConfirmApply  (ConfirmRequest)     returns (Empty);
+  rpc Apply         (ApplyRequest)       returns (ApplyResponse);   // starts rollback timer
+  rpc ConfirmApply  (ConfirmRequest)     returns (Empty);           // cancels rollback
 }
 
+message CreateRuleRequest {
+  string idempotency_key = 1 [(buf.validate.field).string.min_len = 1];
+  Rule rule = 2;
+}
+message UpdateRuleRequest {
+  Rule rule = 1;
+  google.protobuf.FieldMask update_mask = 2;
+}
+message ListRulesRequest {
+  int32 page_size = 1 [(buf.validate.field).int32.lte = 1000];
+  string page_token = 2;   // opaque cursor
+}
+message ListRulesResponse {
+  repeated Rule rules = 1;
+  string next_page_token = 2;
+}
+message ApplyResponse {
+  int64 rollback_deadline_unix_ms = 1;  // when auto-revert fires if unconfirmed
+  string changeset_id = 2;              // idempotency token for ConfirmApply
+}
+message DryRunResponse {
+  repeated string nftables_diff = 1;   // human-readable nftables changes
+  repeated string affected_traffic = 2; // description of traffic impact
+  repeated string conflicts = 3;        // detected rule conflicts
+}
+
+// ── Event Log ─────────────────────────────────────────────
 service EventService {
   rpc QueryEvents   (EventQuery)         returns (EventQueryResponse);
   rpc ManageSession (stream SessionReq)  returns (stream SessionEvent);  // bidi streaming
@@ -456,34 +753,89 @@ service EventService {
   rpc ExportEvents  (ExportRequest)      returns (stream ExportChunk);
 }
 
+message SessionReq {
+  oneof payload {
+    SessionStart  start  = 1;
+    FilterUpdate  filter = 2;
+    Ping          ping   = 3;   // keepalive
+    Pause         pause  = 4;
+    Resume        resume = 5;
+  }
+}
+message SessionStart {
+  EventFilter initial_filter = 1;
+}
+message FilterUpdate {
+  EventFilter filter = 1;   // replaces current filter mid-stream
+}
+message SessionEvent {
+  oneof payload {
+    Event       event  = 1;
+    Pong        pong   = 2;
+    StatusUpdate status = 3;
+  }
+}
+message EventFilter {
+  repeated string severity  = 1;   // filter by severity levels
+  string src_ip_prefix      = 2;   // CIDR or prefix
+  string fts_query          = 3;   // FTS5 query string
+  int64  since_unix_ms      = 4;
+}
+
+// ── Detection ─────────────────────────────────────────────
 service DetectionService {
   rpc GetDetectors      (Empty)              returns (DetectorList);
   rpc UpdateDetector    (DetectorConfig)     returns (Empty);
   rpc GetThreatSummary  (ThreatSummaryReq)   returns (ThreatSummary);
   rpc ListBlockedIps    (BlockedIpsRequest)  returns (BlockedIpsResponse);
   rpc UnblockIp         (UnblockRequest)     returns (Empty);
+  rpc UpdateSignatures  (Empty)              returns (UpdateSignaturesResponse);
 }
 
+// ── System ────────────────────────────────────────────────
 service SystemService {
   rpc GetStatus     (Empty)             returns (SystemStatus);
   rpc GetHealth     (Empty)             returns (HealthResponse);
   rpc GetMetrics    (Empty)             returns (MetricsSnapshot);
   rpc Reload        (Empty)             returns (Empty);
   rpc GetAuditLog   (AuditLogRequest)   returns (AuditLogResponse);
+  rpc GenerateBundle(Empty)             returns (stream BundleChunk);
 }
+// Also implements grpc.health.v1.Health (Check + Watch)
 ```
-
-Also implements `grpc.health.v1.Health` (standard health check protocol).
 
 ### 9.3 API Design Decisions
 
-- **Error model**: `google.rpc.Status` with `BadRequest`, `ErrorInfo` details — not raw status codes
-- **Pagination**: cursor-based page tokens (not offset) on all list RPCs
-- **Field masks**: `google.protobuf.FieldMask` on all update RPCs
-- **Idempotency keys**: all mutation RPCs accept `idempotency_key` field
-- **Versioning**: `package aegis.v1` from day one; daemon serves v1 and future v2 simultaneously during transitions
-- **Compression**: gzip on all RPCs, critical for streaming
-- **Bidirectional streaming**: `ManageSession` allows TUI to send filter changes while receiving events
+**Error model:** All errors use `google.rpc.Status` with typed details:
+- Input errors → `BadRequest` with per-field violations
+- Auth errors → `ErrorInfo` with `domain="aegis"` and `reason` field (stable code)
+- Not found → `ResourceInfo` naming the missing resource
+- Quota exceeded → `QuotaFailure` + `RetryInfo`
+
+**Stable error codes (application-level, in `ErrorInfo.reason`):**
+
+| Code | Meaning |
+|---|---|
+| `RULE_NOT_FOUND` | Rule ID does not exist |
+| `RULE_CONFLICT` | New rule conflicts with existing rule |
+| `APPLY_IN_PROGRESS` | Another Apply is active; confirm or wait |
+| `ROLLBACK_EXPIRED` | ConfirmApply called after deadline |
+| `CERT_PERMISSION_DENIED` | Role insufficient for this RPC |
+| `PRIVILEGED_UNAVAILABLE` | aegis-privileged process not reachable |
+| `SIGNATURE_UPDATE_FAILED` | Threat intel download failed |
+
+**Performance SLOs (pass/fail criteria for benchmarks):**
+
+| Metric | Target |
+|---|---|
+| Detection pipeline throughput | ≥ 100k packets/sec on 4-core machine |
+| Per-packet added latency (p99) | ≤ 500µs |
+| Flow table capacity | ≥ 500k concurrent flows |
+| gRPC RPC latency (p99, local) | ≤ 5ms for read RPCs |
+| SQLite batch write throughput | ≥ 10k events/sec sustained |
+| Daemon RSS memory under load | ≤ 512MB |
+
+These are benchmarked via `criterion` in CI; regressions block merge.
 
 ---
 
@@ -502,7 +854,7 @@ Also implements `grpc.health.v1.Health` (standard health check protocol).
 
 ### 10.2 Architecture
 
-**Panic recovery hook** (set before terminal initialization):
+**Panic recovery hook** (first thing set, before terminal init):
 ```rust
 let hook = std::panic::take_hook();
 std::panic::set_hook(Box::new(move |info| {
@@ -512,35 +864,40 @@ std::panic::set_hook(Box::new(move |info| {
 }));
 ```
 
-**Event loop** (single `tokio::select!` multiplexing all inputs):
+**Event loop** (single `tokio::select!`):
 ```rust
 loop {
     terminal.draw(|f| app.render(f))?;
     tokio::select! {
         Some(key) = crossterm_events.next() => app.dispatch(Action::from(key)),
-        Some(evt) = grpc_stream.next()      => app.dispatch(Action::EventReceived(evt)),
-        _ = render_ticker.tick()            => {}  // capped at 60fps
+        Some(evt) = grpc_stream.next()      => app.dispatch(Action::ServerEvent(evt)),
+        _ = render_ticker.tick()            => {}  // 60fps cap
     }
 }
 ```
 
-**State management** (unidirectional, Redux-style):
+**State management** (Redux-style, pure update function):
 ```rust
-enum Action { NavigateTo(Screen), EventReceived(Event), RuleToggled(RuleId), FilterChanged(String) }
-fn update(state: &mut AppState, action: Action) { /* pure function, unit-testable */ }
+enum Action {
+    NavigateTo(Screen),
+    ServerEvent(SessionEvent),
+    FilterChanged(EventFilter),
+    RuleToggled(RuleId),
+    ConfirmDialog(bool),
+}
+fn update(state: &mut AppState, action: Action) { /* pure, unit-testable without terminal */ }
 ```
 
 ### 10.3 UX Details
 
-- Rollback countdown shown as persistent top banner when `Apply` is in-progress
-- All destructive actions require confirmation dialog (`y/N`)
-- `?` opens contextual keybinding help on any screen
-- Mouse support (`EnableMouseCapture`): click to select, scroll
-- `NO_COLOR` env var + `--color` flag respected
-- High-contrast theme option
-- Minimum 80×24 with graceful degradation check on startup
-- Session preferences persisted in `~/.config/aegis/tui.toml`
-- Connects to `ManageSession` bidirectional stream on start; graceful reconnect with backoff
+- Rollback countdown: persistent top banner `[ROLLBACK IN 47s — press 'c' to confirm]` when Apply in progress
+- All destructive actions: confirmation dialog `Are you sure? [y/N]`
+- `?`: contextual keybinding help overlay on any screen
+- Mouse: `EnableMouseCapture` — click to select rows, scroll event lists
+- Color: `NO_COLOR` env var + `--color` flag; high-contrast theme option in config
+- Minimum 80×24; `terminal_size()` check on startup with clear error if too small
+- Preferences persisted: `~/.config/aegis/tui.toml` (last screen, column widths, active filters)
+- gRPC connection: `ManageSession` bidirectional stream; exponential backoff reconnect (100ms base, 30s max)
 
 ---
 
@@ -553,11 +910,11 @@ fn update(state: &mut AppState, action: Action) { /* pure function, unit-testabl
 aegis rules list [--json|--yaml]
 aegis rules get <id>
 aegis rules add --name <n> --src <cidr> --dst-port <p> --proto <p> --action <a>
-aegis rules edit <id> --enabled false
+aegis rules edit <id> [--enabled true|false] [--priority <n>]
 aegis rules delete <id>
-aegis rules reorder <id> --priority 5
+aegis rules reorder <id> --priority <n>
 aegis rules dry-run
-aegis rules apply [--timeout 60s]
+aegis rules apply [--timeout <seconds>]
 aegis rules confirm
 
 # Events
@@ -578,52 +935,81 @@ aegis config show
 aegis update signatures
 aegis diagnose
 aegis doctor
+aegis pki rotate-client --role <admin|operator|monitor|ci>
+
+# Meta
 aegis completions <bash|zsh|fish|powershell>
-aegis --version
+aegis --version    # semver + git hash + build date + rustc version
 ```
 
 ### 11.2 CLI Design Decisions
 
-- **Output**: human table (default), `--json`, `--yaml`, `--quiet` (exit codes only)
-- **Errors**: `miette` crate — actionable errors with context, hints, suggestions
-- **Paging**: long output auto-pipes through `$PAGER` (respects `--no-pager`)
-- **Progress**: `indicatif` progress bars for long ops; suppressed when `--json` or non-TTY
+- **Output**: human table via `comfy-table` (default), `--json`, `--yaml`, `--quiet` (exit codes only, nothing to stdout)
+- **Errors**: `miette` crate — actionable errors with context, hints, suggestions printed to stderr
+- **Paging**: long output auto-pipes through `$PAGER` (respects `--no-pager` flag and non-TTY detection)
+- **Progress**: `indicatif` progress bars for long ops; suppressed when `--json` or non-TTY (pipe-safe)
 - **Shell completions**: `clap_complete` (bash/zsh/fish/powershell)
-- **Man pages**: `clap_mangen` at build time
-- **Retry**: reconnect with exponential backoff if daemon is starting up
-- **Exit codes**: `0` success · `1` error · `2` connection error · `3` auth error · `4` partial success
+- **Man pages**: `clap_mangen` generates `aegis.1` and sub-command pages at build time
+- **Retry**: if daemon socket not yet accepting connections, retry with 100ms backoff up to 5s before failing
+- **Idempotency**: all mutation commands generate a UUID `idempotency_key` per invocation
+
+**Exit codes:**
+```
+0 → success
+1 → general error
+2 → connection error (daemon not running or socket missing)
+3 → auth error (cert rejected or insufficient role)
+4 → partial success (e.g., some rules applied, some rejected)
+5 → timeout (e.g., Apply rollback expired before confirm)
+```
 
 ### 11.3 `aegis doctor` Output
 
 ```
 aegis doctor
 ✓ nftables available (v1.0.7)
-✓ kernel modules: nf_tables, nfnetlink_queue
-✓ CAP_NET_ADMIN available
+✓ kernel modules: nf_tables, nfnetlink_queue loaded
+✓ CAP_NET_ADMIN available to aegis-privileged
 ✗ GeoIP database missing → run 'aegis update signatures'
-✓ daemon socket accessible
-✓ mTLS cert valid (expires 2027-03-15)
+✓ daemon socket /run/aegis/mgmt.sock accessible
+✓ mTLS cert valid (CN=aegis-admin, expires 2027-03-15)
+✓ aegis-privileged process running (pid 1234)
+✓ SQLite integrity: ok
+✓ Audit log chain: ok (1,423 entries)
 ```
 
 ---
 
 ## 12. Observability
 
-- **Metrics**: Prometheus-compatible endpoint (`/metrics`) from daemon
-- **Tracing**: OpenTelemetry via `opentelemetry` + `tracing-opentelemetry`; OTLP export (Jaeger, Datadog, Grafana Tempo)
-- **Logging**: structured JSON logs with correlation IDs; all gRPC calls instrumented
-- **Every packet** through detection pipeline gets a trace span
+### 12.1 Metrics (Prometheus)
+Exposed from daemon's internal HTTP server on `127.0.0.1:9100/metrics` (not gRPC). Key metrics:
+- `aegis_packets_total{verdict}` — packets by verdict
+- `aegis_detection_score_histogram` — risk score distribution
+- `aegis_flow_table_size` — current flow table entries
+- `aegis_events_written_total` — event store throughput
+- `aegis_ruleset_version` — current ruleset apply counter
+
+### 12.2 Tracing (OpenTelemetry)
+`opentelemetry` + `tracing-opentelemetry` + `opentelemetry-otlp`. Exports to OTLP endpoint (configurable, default disabled). Every packet through detection gets a span. Every gRPC call instrumented via tower middleware.
+
+### 12.3 Structured Logging
+`tracing` crate with `tracing-subscriber` JSON formatter. Correlation IDs on all gRPC calls and packet traces. Output: systemd journal (via `tracing-journald`) + optional JSON log file.
 
 ---
 
 ## 13. Testing Strategy
 
-- **Unit tests**: pure functions, state reducers, rule validation, detection scoring
-- **Property-based tests**: `proptest` on rule engine (random rule sets, expect no panics/invalid state)
-- **Integration tests**: against real nftables in CI (Linux runner)
-- **Fuzz tests**: `cargo-fuzz` targets for packet decoder, TOML rule parser, gRPC message handling, nftables JSON response parser
-- **Performance benchmarks**: `criterion` on detection pipeline throughput, packet decoder latency
-- **End-to-end tests**: daemon + TUI + CLI against a real nftables environment
+| Layer | Approach | Tooling |
+|---|---|---|
+| Unit | Pure functions, state reducers, rule validation, score aggregation | `#[test]` |
+| Property-based | Rule engine, score aggregation, packet decoder — random inputs | `proptest` |
+| Integration | Real nftables on Linux CI runner; apply + verify kernel state | `#[tokio::test]` |
+| Fuzz | Packet decoder, TOML rule parser, gRPC messages, nftables JSON responses | `cargo-fuzz` |
+| Benchmark | Detection pipeline throughput, packet decoder latency; SLOs from §9.3 | `criterion` |
+| End-to-end | Daemon + TUI headless + CLI against real nftables environment | `assert_cmd` |
+
+Benchmarks run in CI; any regression against SLOs in §9.3 blocks merge.
 
 ---
 
@@ -633,18 +1019,20 @@ aegis doctor
 |---|---|
 | `tokio` | Async runtime |
 | `rayon` | Detection thread pool |
-| `crossbeam` | Lock-free channels for packet pipeline |
+| `crossbeam-channel` | Lock-free channels for packet pipeline |
+| `async-trait` | Async fn in dyn-safe traits |
 | `tonic` | gRPC |
-| `tonic-web` | gRPC-Web for future browser client |
+| `tonic-web` | gRPC-Web stub (phase 2 activation) |
 | `prost` | Protobuf |
-| `nftables` | nftables JSON API |
 | `nfq` | Pure Rust NFQUEUE |
-| `pnet` / `etherparse` | Packet parsing |
+| `etherparse` | Packet parsing (more ergonomic than pnet) |
 | `bytes` | Zero-copy packet buffers |
-| `dashmap` | Concurrent hashmaps (flow table, ip_stats) |
+| `moka` | Concurrent LRU-TTL cache for flow table |
+| `dashmap` | Concurrent hashmap for ip_stats |
 | `aho-corasick` | Multi-pattern DPI matching |
 | `maxminddb` | GeoIP lookups |
-| `sqlx` | SQLite async (compile-time verified queries) |
+| `rusqlite` | SQLite with bundled SQLCipher |
+| `rusqlite_migration` | Schema migrations |
 | `ringbuf` | Lock-free ring buffer (hot event tier) |
 | `zstd` | Cold storage compression |
 | `ratatui` | TUI framework |
@@ -654,10 +1042,19 @@ aegis doctor
 | `clap_mangen` | Man page generation |
 | `miette` | Actionable CLI error reporting |
 | `indicatif` | Progress bars |
+| `comfy-table` | CLI table output |
 | `opentelemetry` | Distributed tracing |
+| `tracing` | Structured logging |
+| `tracing-opentelemetry` | OTLP trace export |
+| `tracing-journald` | Systemd journal integration |
 | `seccompiler` | Seccomp-BPF syscall filtering |
 | `tower` | Middleware / interceptor chain |
+| `bincode` | IPC wire format |
+| `serde_json` | nftables JSON generation |
+| `argon2` | Key derivation for SQLCipher + audit HMAC |
+| `protovalidate` | Proto field validation at runtime |
 | `thiserror` | Library error types |
 | `anyhow` | Application error handling |
 | `proptest` | Property-based testing |
 | `criterion` | Benchmarking |
+| `cargo-fuzz` | Fuzz testing |
