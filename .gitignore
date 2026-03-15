@@ -1,0 +1,10 @@
+/target/
+# NOTE: Cargo.lock is intentionally committed for binary workspaces
+# (reproducible builds, security auditing of exact dep versions)
+*.db
+*.db-wal
+*.db-shm
+*.db.zst
+/etc/
+/run/
+/var/
