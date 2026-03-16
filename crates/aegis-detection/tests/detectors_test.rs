@@ -4,6 +4,7 @@ use aegis_detection::{
     model::{DecodedPacket, DetectionContext, FlowState, TcpFlags},
     detectors::port_scan::PortScanDetector,
     detectors::syn_flood::SynFloodDetector,
+    detectors::rate_limiter::RateLimiter,
     Detector,
 };
 use aegis_rules::model::{Direction, Protocol};
@@ -107,4 +108,35 @@ fn syn_flood_normal_ratio_does_not_trigger() {
     let flow = make_flow_with_counts(15, 12); // ratio ≈ 1.15
     let result = detector.inspect(&make_packet("3.4.5.6", 80), &flow, &default_ctx());
     assert_eq!(result.score, 0);
+}
+
+// ── RateLimiter ──────────────────────────────────────────────────────────────
+
+#[test]
+fn rate_limiter_allows_within_capacity() {
+    // capacity=5, rate=100/s — first 5 immediate packets should pass
+    let detector = RateLimiter::new(100.0, 5.0);
+    let flow = default_flow();
+    let ctx = default_ctx();
+    let pkt = make_packet("4.5.6.7", 80);
+    for _ in 0..5 {
+        let r = detector.inspect(&pkt, &flow, &ctx);
+        assert_eq!(r.score, 0, "should be within capacity");
+    }
+}
+
+#[test]
+fn rate_limiter_blocks_when_tokens_exhausted() {
+    // capacity=2, rate=0.001/s (negligible refill)
+    let detector = RateLimiter::new(0.001, 2.0);
+    let flow = default_flow();
+    let ctx = default_ctx();
+    let pkt = make_packet("5.6.7.8", 80);
+    // consume 2 tokens
+    detector.inspect(&pkt, &flow, &ctx);
+    detector.inspect(&pkt, &flow, &ctx);
+    // 3rd packet: no tokens, should be rate-limited
+    let r = detector.inspect(&pkt, &flow, &ctx);
+    assert_eq!(r.score, 60);
+    assert!(r.reason.is_some());
 }
