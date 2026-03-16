@@ -5,6 +5,7 @@ use aegis_detection::{
     detectors::port_scan::PortScanDetector,
     detectors::syn_flood::SynFloodDetector,
     detectors::rate_limiter::RateLimiter,
+    detectors::ip_reputation::IpReputationDetector,
     Detector,
 };
 use aegis_rules::model::{Direction, Protocol};
@@ -139,4 +140,43 @@ fn rate_limiter_blocks_when_tokens_exhausted() {
     let r = detector.inspect(&pkt, &flow, &ctx);
     assert_eq!(r.score, 60);
     assert!(r.reason.is_some());
+}
+
+// ── IpReputationDetector ─────────────────────────────────────────────────────
+
+#[test]
+fn ip_reputation_blocks_listed_ip() {
+    let detector = IpReputationDetector::new();
+    detector.load_from_str("1.2.3.4\n5.6.7.8\n");
+    let result = detector.inspect(&make_packet("1.2.3.4", 80), &default_flow(), &default_ctx());
+    assert_eq!(result.score, 100);
+}
+
+#[test]
+fn ip_reputation_allows_unlisted_ip() {
+    let detector = IpReputationDetector::new();
+    detector.load_from_str("1.2.3.4\n");
+    let result = detector.inspect(&make_packet("9.9.9.9", 80), &default_flow(), &default_ctx());
+    assert_eq!(result.score, 0);
+}
+
+#[test]
+fn ip_reputation_hot_swap_clears_old_list() {
+    use std::collections::HashSet;
+    let detector = IpReputationDetector::new();
+    detector.load_from_str("1.2.3.4\n");
+    // hot-swap with empty set
+    detector.swap_blocklist(HashSet::new());
+    let result = detector.inspect(&make_packet("1.2.3.4", 80), &default_flow(), &default_ctx());
+    assert_eq!(result.score, 0, "IP should be cleared after hot-swap");
+}
+
+#[test]
+fn ip_reputation_skips_invalid_lines() {
+    let detector = IpReputationDetector::new();
+    detector.load_from_str("1.2.3.4\nnot-an-ip\n5.6.7.8\n");
+    assert_eq!(
+        detector.inspect(&make_packet("5.6.7.8", 80), &default_flow(), &default_ctx()).score,
+        100
+    );
 }
