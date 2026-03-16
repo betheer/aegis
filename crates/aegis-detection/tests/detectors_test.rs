@@ -1,0 +1,72 @@
+// Shared detector tests — new tests and imports are added as each detector is implemented.
+// Each task that adds a new detector appends both the import and the test functions.
+use aegis_detection::{
+    model::{DecodedPacket, DetectionContext, FlowState, TcpFlags},
+    detectors::port_scan::PortScanDetector,
+    Detector,
+};
+use aegis_rules::model::{Direction, Protocol};
+use bytes::Bytes;
+
+fn make_packet(src_ip: &str, dst_port: u16) -> DecodedPacket {
+    DecodedPacket {
+        src_ip: src_ip.parse().unwrap(),
+        dst_ip: "10.0.0.1".parse().unwrap(),
+        src_port: Some(50000),
+        dst_port: Some(dst_port),
+        protocol: Protocol::Tcp,
+        direction: Direction::Inbound,
+        tcp_flags: Some(TcpFlags::default()),
+        payload: Bytes::new(),
+        packet_len: 40,
+    }
+}
+
+fn default_flow() -> FlowState { FlowState::new() }
+fn default_ctx() -> DetectionContext { DetectionContext::default() }
+
+// ── PortScanDetector ─────────────────────────────────────────────────────────
+
+#[test]
+fn port_scan_triggers_above_threshold() {
+    let detector = PortScanDetector::new(60, 5);
+    let flow = default_flow();
+    let ctx = default_ctx();
+    // Contact 6 distinct ports — exceeds threshold of 5
+    for port in 80u16..86 {
+        detector.inspect(&make_packet("1.2.3.4", port), &flow, &ctx);
+    }
+    let result = detector.inspect(&make_packet("1.2.3.4", 99), &flow, &ctx);
+    assert_eq!(result.score, 80, "expected port scan detection");
+}
+
+#[test]
+fn port_scan_does_not_trigger_below_threshold() {
+    let detector = PortScanDetector::new(60, 20);
+    let flow = default_flow();
+    let ctx = default_ctx();
+    for port in 80u16..85 {
+        detector.inspect(&make_packet("2.3.4.5", port), &flow, &ctx);
+    }
+    let result = detector.inspect(&make_packet("2.3.4.5", 85), &flow, &ctx);
+    assert_eq!(result.score, 0);
+}
+
+#[test]
+fn port_scan_different_ips_tracked_separately() {
+    let detector = PortScanDetector::new(60, 3);
+    let flow = default_flow();
+    let ctx = default_ctx();
+    // IP A contacts 2 ports
+    for port in [80u16, 443] {
+        detector.inspect(&make_packet("10.0.0.1", port), &flow, &ctx);
+    }
+    // IP B contacts 4 ports — should trigger
+    for port in [80u16, 81, 82, 83] {
+        detector.inspect(&make_packet("10.0.0.2", port), &flow, &ctx);
+    }
+    let result_a = detector.inspect(&make_packet("10.0.0.1", 8080), &flow, &ctx);
+    let result_b = detector.inspect(&make_packet("10.0.0.2", 8080), &flow, &ctx);
+    assert_eq!(result_a.score, 0, "IP A should not trigger yet");
+    assert_eq!(result_b.score, 80, "IP B should trigger");
+}
