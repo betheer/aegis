@@ -145,60 +145,59 @@ impl EventWriter {
 
     /// Query events with filtering. Returns results in descending timestamp order.
     pub fn query(&self, conn: &Connection, q: &EventQuery) -> Result<Vec<Event>> {
+        use rusqlite::types::Value;
+
         let mut sql = String::from(
             "SELECT id,ts,severity,kind,src_ip,dst_ip,src_port,dst_port,protocol,
                     rule_id,detector,score,hit_count,first_seen,last_seen,
                     reason_code,reason_desc,raw_meta
              FROM events WHERE 1=1",
         );
-        let mut conditions: Vec<String> = vec![];
+        let mut param_values: Vec<Value> = vec![];
 
         if let Some(since) = q.since_ms {
-            conditions.push(format!("ts >= {}", since));
+            sql.push_str(" AND ts >= ?");
+            param_values.push(Value::Integer(since));
         }
         if let Some(until) = q.until_ms {
-            conditions.push(format!("ts <= {}", until));
+            sql.push_str(" AND ts <= ?");
+            param_values.push(Value::Integer(until));
         }
         if let Some(ref s) = q.severity {
-            conditions.push(format!("severity = '{}'", s.as_str()));
+            sql.push_str(" AND severity = ?");
+            param_values.push(Value::Text(s.as_str().to_string()));
         }
 
-        for c in &conditions {
-            sql.push_str(&format!(" AND {}", c));
-        }
         sql.push_str(" ORDER BY ts DESC");
         if let Some(limit) = q.limit {
             sql.push_str(&format!(" LIMIT {}", limit));
         }
 
         let mut stmt = conn.prepare(&sql)?;
-        let events = stmt
-            .query_map([], |r| {
-                Ok(Event {
-                    id: Some(r.get(0)?),
-                    ts: r.get(1)?,
-                    severity: Severity::from_str(&r.get::<_, String>(2)?).unwrap_or(Severity::Info),
-                    kind: EventKind::from_str(&r.get::<_, String>(3)?).unwrap_or(EventKind::Block),
-                    src_ip: r.get(4)?,
-                    dst_ip: r.get(5)?,
-                    src_port: r.get(6)?,
-                    dst_port: r.get(7)?,
-                    protocol: r.get(8)?,
-                    rule_id: r.get(9)?,
-                    detector: r.get(10)?,
-                    score: r.get(11)?,
-                    hit_count: r.get(12)?,
-                    first_seen: r.get(13)?,
-                    last_seen: r.get(14)?,
-                    reason_code: r.get(15)?,
-                    reason_desc: r.get(16)?,
-                    raw_meta: r.get(17)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(events)
+        let rows = stmt.query_map(rusqlite::params_from_iter(param_values.iter()), |r| {
+            Ok(Event {
+                id: Some(r.get(0)?),
+                ts: r.get(1)?,
+                severity: Severity::from_str(&r.get::<_, String>(2)?).unwrap_or(Severity::Info),
+                kind: EventKind::from_str(&r.get::<_, String>(3)?).unwrap_or(EventKind::Block),
+                src_ip: r.get(4)?,
+                dst_ip: r.get(5)?,
+                src_port: r.get(6)?,
+                dst_port: r.get(7)?,
+                protocol: r.get(8)?,
+                rule_id: r.get(9)?,
+                detector: r.get(10)?,
+                score: r.get(11)?,
+                hit_count: r.get(12)?,
+                first_seen: r.get(13)?,
+                last_seen: r.get(14)?,
+                reason_code: r.get(15)?,
+                reason_desc: r.get(16)?,
+                raw_meta: r.get(17)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(crate::error::StoreError::from))
+            .collect()
     }
 }
 
