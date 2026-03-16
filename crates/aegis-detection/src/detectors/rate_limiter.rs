@@ -3,7 +3,7 @@ use aegis_rules::model::BlockReason;
 use aegis_store::model::Severity;
 use dashmap::DashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 struct TokenBucket {
@@ -33,7 +33,7 @@ impl TokenBucket {
 }
 
 pub struct RateLimiter {
-    buckets: DashMap<IpAddr, Mutex<TokenBucket>>,
+    buckets: DashMap<IpAddr, Arc<Mutex<TokenBucket>>>,
     rate: f64,
     capacity: f64,
 }
@@ -53,10 +53,13 @@ impl Detector for RateLimiter {
     fn weight(&self) -> f32 { 1.0 }
 
     fn inspect(&self, packet: &DecodedPacket, _flow: &FlowState, _ctx: &DetectionContext) -> DetectorResult {
-        let entry = self.buckets
+        // Clone the Arc out of the DashMap immediately, releasing the shard lock
+        // before acquiring the TokenBucket Mutex. This prevents holding two locks simultaneously.
+        let bucket = self.buckets
             .entry(packet.src_ip)
-            .or_insert_with(|| Mutex::new(TokenBucket::new(self.rate, self.capacity)));
-        let allowed = entry.lock().unwrap().try_consume();
+            .or_insert_with(|| Arc::new(Mutex::new(TokenBucket::new(self.rate, self.capacity))))
+            .clone();
+        let allowed = bucket.lock().unwrap().try_consume();
         if !allowed {
             let reason = BlockReason {
                 code: "rate_exceeded".to_string(),

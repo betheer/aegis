@@ -26,6 +26,12 @@ impl GeoBlockDetector {
     }
 }
 
+impl Default for GeoBlockDetector {
+    fn default() -> Self {
+        Self::new(None, vec![])
+    }
+}
+
 impl Detector for GeoBlockDetector {
     fn name(&self) -> &'static str { "geo_block" }
     fn weight(&self) -> f32 { 1.0 }

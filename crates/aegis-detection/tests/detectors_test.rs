@@ -60,21 +60,35 @@ fn port_scan_does_not_trigger_below_threshold() {
 
 #[test]
 fn port_scan_different_ips_tracked_separately() {
-    let detector = PortScanDetector::new(60, 3);
+    // threshold=4: IP A reaches 3 distinct ports (below threshold), IP B reaches 5 (at/above)
+    let detector = PortScanDetector::new(60, 4);
     let flow = default_flow();
     let ctx = default_ctx();
     // IP A contacts 2 ports
     for port in [80u16, 443] {
         detector.inspect(&make_packet("10.0.0.1", port), &flow, &ctx);
     }
-    // IP B contacts 4 ports — should trigger
+    // IP B contacts 4 ports — meets threshold, should trigger
     for port in [80u16, 81, 82, 83] {
         detector.inspect(&make_packet("10.0.0.2", port), &flow, &ctx);
     }
-    let result_a = detector.inspect(&make_packet("10.0.0.1", 8080), &flow, &ctx);
-    let result_b = detector.inspect(&make_packet("10.0.0.2", 8080), &flow, &ctx);
+    let result_a = detector.inspect(&make_packet("10.0.0.1", 8080), &flow, &ctx); // IP A: 3 distinct, below 4
+    let result_b = detector.inspect(&make_packet("10.0.0.2", 8080), &flow, &ctx); // IP B: 5 distinct, >= 4
     assert_eq!(result_a.score, 0, "IP A should not trigger yet");
     assert_eq!(result_b.score, 80, "IP B should trigger");
+}
+
+#[test]
+fn port_scan_triggers_at_exact_threshold() {
+    let detector = PortScanDetector::new(60, 3);
+    let flow = default_flow();
+    let ctx = default_ctx();
+    // Contact exactly 3 distinct ports — equals threshold, should trigger
+    for port in [80u16, 443, 8080] {
+        detector.inspect(&make_packet("7.8.9.0", port), &flow, &ctx);
+    }
+    let result = detector.inspect(&make_packet("7.8.9.0", 8080), &flow, &ctx); // repeat port, still 3 distinct
+    assert_eq!(result.score, 80, "exactly threshold distinct ports should trigger");
 }
 
 // ── SynFloodDetector ─────────────────────────────────────────────────────────

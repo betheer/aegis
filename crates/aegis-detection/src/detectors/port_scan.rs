@@ -44,7 +44,7 @@ impl Detector for PortScanDetector {
         entry.push_back((now, dst_port));
 
         let distinct: HashSet<u16> = entry.iter().map(|(_, p)| *p).collect();
-        if distinct.len() > self.threshold {
+        if distinct.len() >= self.threshold {
             let reason = BlockReason {
                 code: "port_scan".to_string(),
                 description: format!(
