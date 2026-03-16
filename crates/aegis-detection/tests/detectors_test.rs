@@ -3,6 +3,7 @@
 use aegis_detection::{
     model::{DecodedPacket, DetectionContext, FlowState, TcpFlags},
     detectors::port_scan::PortScanDetector,
+    detectors::syn_flood::SynFloodDetector,
     Detector,
 };
 use aegis_rules::model::{Direction, Protocol};
@@ -69,4 +70,41 @@ fn port_scan_different_ips_tracked_separately() {
     let result_b = detector.inspect(&make_packet("10.0.0.2", 8080), &flow, &ctx);
     assert_eq!(result_a.score, 0, "IP A should not trigger yet");
     assert_eq!(result_b.score, 80, "IP B should trigger");
+}
+
+// ── SynFloodDetector ─────────────────────────────────────────────────────────
+
+fn make_flow_with_counts(syn: u32, ack: u32) -> FlowState {
+    let mut state = FlowState::new();
+    for _ in 0..syn {
+        state.update_tcp_flags(&TcpFlags { syn: true, ..Default::default() });
+    }
+    for _ in 0..ack {
+        state.update_tcp_flags(&TcpFlags { ack: true, ..Default::default() });
+    }
+    state
+}
+
+#[test]
+fn syn_flood_triggers_above_ratio() {
+    let detector = SynFloodDetector { syn_ratio_threshold: 3.0, min_syn_count: 10 };
+    let flow = make_flow_with_counts(50, 2); // ratio = 50/3 ≈ 16.7
+    let result = detector.inspect(&make_packet("3.4.5.6", 80), &flow, &default_ctx());
+    assert_eq!(result.score, 90);
+}
+
+#[test]
+fn syn_flood_below_min_count_does_not_trigger() {
+    let detector = SynFloodDetector { syn_ratio_threshold: 3.0, min_syn_count: 10 };
+    let flow = make_flow_with_counts(5, 0); // below min_syn_count
+    let result = detector.inspect(&make_packet("3.4.5.6", 80), &flow, &default_ctx());
+    assert_eq!(result.score, 0);
+}
+
+#[test]
+fn syn_flood_normal_ratio_does_not_trigger() {
+    let detector = SynFloodDetector { syn_ratio_threshold: 3.0, min_syn_count: 10 };
+    let flow = make_flow_with_counts(15, 12); // ratio ≈ 1.15
+    let result = detector.inspect(&make_packet("3.4.5.6", 80), &flow, &default_ctx());
+    assert_eq!(result.score, 0);
 }
