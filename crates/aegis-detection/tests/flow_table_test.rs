@@ -31,12 +31,28 @@ fn different_keys_return_different_arcs() {
 #[test]
 fn entry_count_increments() {
     let table = FlowTable::new(1000);
-    table.get_or_create(key(1, 80));
-    table.get_or_create(key(2, 80));
+    let _ = table.get_or_create(key(1, 80));
+    let _ = table.get_or_create(key(2, 80));
     // moka entry_count is updated by a background thread — run_pending_tasks()
     // flushes the write queue synchronously so the count is accurate immediately.
     table.run_pending_tasks();
-    assert!(table.entry_count() >= 1);
+    assert_eq!(table.entry_count(), 2);
+}
+
+#[test]
+fn invalidate_removes_entry_and_resets_state() {
+    let table = FlowTable::new(1000);
+    let k = key(7777, 443);
+    let arc1 = table.get_or_create(k.clone());
+    arc1.lock().unwrap().syn_count = 99;
+
+    table.invalidate(&k);
+    table.run_pending_tasks();
+
+    // After invalidation, a new Arc should be created with fresh state
+    let arc2 = table.get_or_create(k.clone());
+    assert!(!std::sync::Arc::ptr_eq(&arc1, &arc2), "invalidated entry must produce a new Arc");
+    assert_eq!(arc2.lock().unwrap().syn_count, 0, "new Arc must have zeroed state");
 }
 
 #[test]

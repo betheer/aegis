@@ -21,6 +21,7 @@ impl FlowTable {
 
     /// Get or atomically create a FlowState for the given key.
     /// moka guarantees the initializer runs at most once per key.
+    #[must_use]
     pub fn get_or_create(&self, key: FlowKey) -> Arc<Mutex<FlowState>> {
         self.cache
             .get_with(key, || Arc::new(Mutex::new(FlowState::new())))
@@ -38,6 +39,7 @@ impl FlowTable {
     /// Flush moka's internal write queue so that `entry_count` reflects
     /// all inserts made so far. Useful in tests where the background
     /// maintenance thread has not yet had a chance to run.
+    #[doc(hidden)]
     pub fn run_pending_tasks(&self) {
         self.cache.run_pending_tasks();
     }
