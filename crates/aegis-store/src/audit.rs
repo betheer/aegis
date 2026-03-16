@@ -101,14 +101,15 @@ impl AuditLog {
     }
 
     fn last_hmac(&self, conn: &Connection) -> Result<String> {
-        let result: Option<String> = conn
-            .query_row(
-                "SELECT entry_hmac FROM audit_log ORDER BY id DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .ok();
-        Ok(result.unwrap_or_else(|| self.genesis_hash.clone()))
+        match conn.query_row(
+            "SELECT entry_hmac FROM audit_log ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(hmac) => Ok(hmac),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(self.genesis_hash.clone()),
+            Err(e) => Err(StoreError::Database(e)),
+        }
     }
 
     fn compute_hmac(
