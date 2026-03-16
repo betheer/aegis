@@ -25,6 +25,10 @@ ipnet = { version = "2", features = ["serde"] }
 
 # Storage
 rusqlite = { version = "0.31", features = ["bundled", "modern_sqlite"] }
+# NOTE: On Linux/WSL production builds, change "bundled" to "bundled-sqlcipher"
+# SQLCipher (AES-256 DB encryption) requires system OpenSSL (not available on
+# Windows dev without extra setup). The wrong_key_fails_to_open test is #[ignore]
+# on non-SQLCipher builds; all other storage tests pass on both platforms.
 rusqlite_migration = "1"
 crossbeam-queue = "0.3"
 dashmap = "6"
