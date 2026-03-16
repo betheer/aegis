@@ -17,8 +17,7 @@ pub enum DecodeError {
 /// `direction` must be determined by the caller (e.g., from NFQUEUE hook point).
 pub fn decode_ip_packet(raw: &[u8], direction: Direction) -> Result<DecodedPacket, DecodeError> {
     // PacketHeaders::from_ip_slice is the correct etherparse 0.15 API for raw IP packets.
-    let pkt = PacketHeaders::from_ip_slice(raw)
-        .map_err(|e| DecodeError::Parse(e.to_string()))?;
+    let pkt = PacketHeaders::from_ip_slice(raw).map_err(|e| DecodeError::Parse(e.to_string()))?;
 
     let (src_ip, dst_ip) = match &pkt.net {
         Some(NetHeaders::Ipv4(h, _)) => (

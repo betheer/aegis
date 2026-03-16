@@ -15,7 +15,10 @@ fn test_packet() -> DecodedPacket {
         dst_port: Some(80),
         protocol: Protocol::Tcp,
         direction: Direction::Inbound,
-        tcp_flags: Some(TcpFlags { syn: true, ..Default::default() }),
+        tcp_flags: Some(TcpFlags {
+            syn: true,
+            ..Default::default()
+        }),
         payload: Bytes::from_static(b"hello"),
         packet_len: 60,
     }
@@ -24,7 +27,10 @@ fn test_packet() -> DecodedPacket {
 #[test]
 fn flow_state_update_tcp_flags() {
     let mut state = FlowState::new();
-    let flags = TcpFlags { syn: true, ..Default::default() };
+    let flags = TcpFlags {
+        syn: true,
+        ..Default::default()
+    };
     state.update_tcp_flags(&flags);
     state.update_tcp_flags(&flags);
     assert_eq!(state.syn_count, 2);
@@ -47,7 +53,10 @@ fn flow_state_append_payload_caps_at_64k() {
 #[test]
 fn flow_state_is_closed_after_rst() {
     let mut state = FlowState::new();
-    state.update_tcp_flags(&TcpFlags { rst: true, ..Default::default() });
+    state.update_tcp_flags(&TcpFlags {
+        rst: true,
+        ..Default::default()
+    });
     assert!(state.is_closed());
 }
 

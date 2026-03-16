@@ -1,4 +1,6 @@
-use crate::model::{DecodedPacket, DetectionContext, DetectionEvent, Detector, DetectorResult, FlowState};
+use crate::model::{
+    DecodedPacket, DetectionContext, DetectionEvent, Detector, DetectorResult, FlowState,
+};
 use aegis_rules::model::BlockReason;
 use aegis_store::model::Severity;
 
@@ -9,15 +11,27 @@ pub struct SynFloodDetector {
 
 impl Default for SynFloodDetector {
     fn default() -> Self {
-        Self { syn_ratio_threshold: 3.0, min_syn_count: 10 }
+        Self {
+            syn_ratio_threshold: 3.0,
+            min_syn_count: 10,
+        }
     }
 }
 
 impl Detector for SynFloodDetector {
-    fn name(&self) -> &'static str { "syn_flood" }
-    fn weight(&self) -> f32 { 2.0 }
+    fn name(&self) -> &'static str {
+        "syn_flood"
+    }
+    fn weight(&self) -> f32 {
+        2.0
+    }
 
-    fn inspect(&self, _packet: &DecodedPacket, flow: &FlowState, _ctx: &DetectionContext) -> DetectorResult {
+    fn inspect(
+        &self,
+        _packet: &DecodedPacket,
+        flow: &FlowState,
+        _ctx: &DetectionContext,
+    ) -> DetectorResult {
         if flow.syn_count < self.min_syn_count {
             return DetectorResult::pass();
         }

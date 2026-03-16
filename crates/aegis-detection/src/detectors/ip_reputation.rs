@@ -1,4 +1,6 @@
-use crate::model::{DecodedPacket, DetectionContext, DetectionEvent, Detector, DetectorResult, FlowState};
+use crate::model::{
+    DecodedPacket, DetectionContext, DetectionEvent, Detector, DetectorResult, FlowState,
+};
 use aegis_rules::model::BlockReason;
 use aegis_store::model::Severity;
 use std::collections::HashSet;
@@ -11,7 +13,9 @@ pub struct IpReputationDetector {
 
 impl IpReputationDetector {
     pub fn new() -> Self {
-        Self { blocklist: Arc::new(RwLock::new(HashSet::new())) }
+        Self {
+            blocklist: Arc::new(RwLock::new(HashSet::new())),
+        }
     }
 
     /// Atomically replace the blocklist (for hot-swap on threat intel refresh).
@@ -30,18 +34,32 @@ impl IpReputationDetector {
 }
 
 impl Default for IpReputationDetector {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Detector for IpReputationDetector {
-    fn name(&self) -> &'static str { "ip_reputation" }
-    fn weight(&self) -> f32 { 1.5 }
+    fn name(&self) -> &'static str {
+        "ip_reputation"
+    }
+    fn weight(&self) -> f32 {
+        1.5
+    }
 
-    fn inspect(&self, packet: &DecodedPacket, _flow: &FlowState, _ctx: &DetectionContext) -> DetectorResult {
+    fn inspect(
+        &self,
+        packet: &DecodedPacket,
+        _flow: &FlowState,
+        _ctx: &DetectionContext,
+    ) -> DetectorResult {
         if self.blocklist.read().unwrap().contains(&packet.src_ip) {
             let reason = BlockReason {
                 code: "ip_reputation".to_string(),
-                description: format!("Source IP {} is on the reputation block list", packet.src_ip),
+                description: format!(
+                    "Source IP {} is on the reputation block list",
+                    packet.src_ip
+                ),
             };
             DetectorResult {
                 score: 100,

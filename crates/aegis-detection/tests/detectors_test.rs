@@ -1,14 +1,14 @@
 // Shared detector tests — new tests and imports are added as each detector is implemented.
 // Each task that adds a new detector appends both the import and the test functions.
 use aegis_detection::{
-    model::{DecodedPacket, DetectionContext, FlowState, TcpFlags},
-    detectors::port_scan::PortScanDetector,
-    detectors::syn_flood::SynFloodDetector,
-    detectors::rate_limiter::RateLimiter,
-    detectors::ip_reputation::IpReputationDetector,
-    detectors::geo_block::GeoBlockDetector,
-    detectors::protocol_anomaly::ProtocolAnomalyDetector,
     detectors::dpi::DpiDetector,
+    detectors::geo_block::GeoBlockDetector,
+    detectors::ip_reputation::IpReputationDetector,
+    detectors::port_scan::PortScanDetector,
+    detectors::protocol_anomaly::ProtocolAnomalyDetector,
+    detectors::rate_limiter::RateLimiter,
+    detectors::syn_flood::SynFloodDetector,
+    model::{DecodedPacket, DetectionContext, FlowState, TcpFlags},
     Detector,
 };
 use aegis_rules::model::{Direction, Protocol};
@@ -28,8 +28,12 @@ fn make_packet(src_ip: &str, dst_port: u16) -> DecodedPacket {
     }
 }
 
-fn default_flow() -> FlowState { FlowState::new() }
-fn default_ctx() -> DetectionContext { DetectionContext::default() }
+fn default_flow() -> FlowState {
+    FlowState::new()
+}
+fn default_ctx() -> DetectionContext {
+    DetectionContext::default()
+}
 
 // ── PortScanDetector ─────────────────────────────────────────────────────────
 
@@ -88,7 +92,10 @@ fn port_scan_triggers_at_exact_threshold() {
         detector.inspect(&make_packet("7.8.9.0", port), &flow, &ctx);
     }
     let result = detector.inspect(&make_packet("7.8.9.0", 8080), &flow, &ctx); // repeat port, still 3 distinct
-    assert_eq!(result.score, 80, "exactly threshold distinct ports should trigger");
+    assert_eq!(
+        result.score, 80,
+        "exactly threshold distinct ports should trigger"
+    );
 }
 
 // ── SynFloodDetector ─────────────────────────────────────────────────────────
@@ -96,17 +103,26 @@ fn port_scan_triggers_at_exact_threshold() {
 fn make_flow_with_counts(syn: u32, ack: u32) -> FlowState {
     let mut state = FlowState::new();
     for _ in 0..syn {
-        state.update_tcp_flags(&TcpFlags { syn: true, ..Default::default() });
+        state.update_tcp_flags(&TcpFlags {
+            syn: true,
+            ..Default::default()
+        });
     }
     for _ in 0..ack {
-        state.update_tcp_flags(&TcpFlags { ack: true, ..Default::default() });
+        state.update_tcp_flags(&TcpFlags {
+            ack: true,
+            ..Default::default()
+        });
     }
     state
 }
 
 #[test]
 fn syn_flood_triggers_above_ratio() {
-    let detector = SynFloodDetector { syn_ratio_threshold: 3.0, min_syn_count: 10 };
+    let detector = SynFloodDetector {
+        syn_ratio_threshold: 3.0,
+        min_syn_count: 10,
+    };
     let flow = make_flow_with_counts(50, 2); // ratio = 50/3 ≈ 16.7
     let result = detector.inspect(&make_packet("3.4.5.6", 80), &flow, &default_ctx());
     assert_eq!(result.score, 90);
@@ -114,7 +130,10 @@ fn syn_flood_triggers_above_ratio() {
 
 #[test]
 fn syn_flood_below_min_count_does_not_trigger() {
-    let detector = SynFloodDetector { syn_ratio_threshold: 3.0, min_syn_count: 10 };
+    let detector = SynFloodDetector {
+        syn_ratio_threshold: 3.0,
+        min_syn_count: 10,
+    };
     let flow = make_flow_with_counts(5, 0); // below min_syn_count
     let result = detector.inspect(&make_packet("3.4.5.6", 80), &flow, &default_ctx());
     assert_eq!(result.score, 0);
@@ -122,7 +141,10 @@ fn syn_flood_below_min_count_does_not_trigger() {
 
 #[test]
 fn syn_flood_normal_ratio_does_not_trigger() {
-    let detector = SynFloodDetector { syn_ratio_threshold: 3.0, min_syn_count: 10 };
+    let detector = SynFloodDetector {
+        syn_ratio_threshold: 3.0,
+        min_syn_count: 10,
+    };
     let flow = make_flow_with_counts(15, 12); // ratio ≈ 1.15
     let result = detector.inspect(&make_packet("3.4.5.6", 80), &flow, &default_ctx());
     assert_eq!(result.score, 0);
@@ -193,7 +215,9 @@ fn ip_reputation_skips_invalid_lines() {
     let detector = IpReputationDetector::new();
     detector.load_from_str("1.2.3.4\nnot-an-ip\n5.6.7.8\n");
     assert_eq!(
-        detector.inspect(&make_packet("5.6.7.8", 80), &default_flow(), &default_ctx()).score,
+        detector
+            .inspect(&make_packet("5.6.7.8", 80), &default_flow(), &default_ctx())
+            .score,
         100
     );
 }
@@ -238,8 +262,16 @@ fn make_tcp_packet_with_flags(flags: TcpFlags) -> DecodedPacket {
 #[test]
 fn protocol_anomaly_syn_rst_triggers() {
     let detector = ProtocolAnomalyDetector;
-    let flags = TcpFlags { syn: true, rst: true, ..Default::default() };
-    let result = detector.inspect(&make_tcp_packet_with_flags(flags), &default_flow(), &default_ctx());
+    let flags = TcpFlags {
+        syn: true,
+        rst: true,
+        ..Default::default()
+    };
+    let result = detector.inspect(
+        &make_tcp_packet_with_flags(flags),
+        &default_flow(),
+        &default_ctx(),
+    );
     assert_eq!(result.score, 70);
     assert_eq!(result.reason.unwrap().code, "syn_rst");
 }
@@ -247,8 +279,16 @@ fn protocol_anomaly_syn_rst_triggers() {
 #[test]
 fn protocol_anomaly_syn_fin_triggers() {
     let detector = ProtocolAnomalyDetector;
-    let flags = TcpFlags { syn: true, fin: true, ..Default::default() };
-    let result = detector.inspect(&make_tcp_packet_with_flags(flags), &default_flow(), &default_ctx());
+    let flags = TcpFlags {
+        syn: true,
+        fin: true,
+        ..Default::default()
+    };
+    let result = detector.inspect(
+        &make_tcp_packet_with_flags(flags),
+        &default_flow(),
+        &default_ctx(),
+    );
     assert_eq!(result.score, 70);
     assert_eq!(result.reason.unwrap().code, "syn_fin");
 }
@@ -257,7 +297,11 @@ fn protocol_anomaly_syn_fin_triggers() {
 fn protocol_anomaly_null_scan_triggers() {
     let detector = ProtocolAnomalyDetector;
     let flags = TcpFlags::default(); // all false
-    let result = detector.inspect(&make_tcp_packet_with_flags(flags), &default_flow(), &default_ctx());
+    let result = detector.inspect(
+        &make_tcp_packet_with_flags(flags),
+        &default_flow(),
+        &default_ctx(),
+    );
     assert_eq!(result.score, 60);
     assert_eq!(result.reason.unwrap().code, "null_scan");
 }
@@ -265,8 +309,19 @@ fn protocol_anomaly_null_scan_triggers() {
 #[test]
 fn protocol_anomaly_xmas_scan_triggers() {
     let detector = ProtocolAnomalyDetector;
-    let flags = TcpFlags { syn: true, ack: true, fin: true, rst: true, psh: true, urg: true };
-    let result = detector.inspect(&make_tcp_packet_with_flags(flags), &default_flow(), &default_ctx());
+    let flags = TcpFlags {
+        syn: true,
+        ack: true,
+        fin: true,
+        rst: true,
+        psh: true,
+        urg: true,
+    };
+    let result = detector.inspect(
+        &make_tcp_packet_with_flags(flags),
+        &default_flow(),
+        &default_ctx(),
+    );
     assert_eq!(result.score, 75);
     assert_eq!(result.reason.unwrap().code, "xmas_scan");
 }
@@ -274,8 +329,15 @@ fn protocol_anomaly_xmas_scan_triggers() {
 #[test]
 fn protocol_anomaly_normal_syn_passes() {
     let detector = ProtocolAnomalyDetector;
-    let flags = TcpFlags { syn: true, ..Default::default() };
-    let result = detector.inspect(&make_tcp_packet_with_flags(flags), &default_flow(), &default_ctx());
+    let flags = TcpFlags {
+        syn: true,
+        ..Default::default()
+    };
+    let result = detector.inspect(
+        &make_tcp_packet_with_flags(flags),
+        &default_flow(),
+        &default_ctx(),
+    );
     assert_eq!(result.score, 0);
 }
 
@@ -299,10 +361,11 @@ fn make_flow_with_payload(data: &[u8]) -> FlowState {
 
 #[test]
 fn dpi_matches_pattern_in_payload() {
-    let detector = DpiDetector::from_patterns(vec![
-        ("malware-c2".to_string(), "POST /beacon".to_string()),
-    ]).unwrap();
-    let flow = make_flow_with_payload(b"GET / HTTP/1.1\r\nHost: example.com\r\nPOST /beacon HTTP/1.1");
+    let detector =
+        DpiDetector::from_patterns(vec![("malware-c2".to_string(), "POST /beacon".to_string())])
+            .unwrap();
+    let flow =
+        make_flow_with_payload(b"GET / HTTP/1.1\r\nHost: example.com\r\nPOST /beacon HTTP/1.1");
     let result = detector.inspect(&make_packet("1.2.3.4", 80), &flow, &default_ctx());
     assert_eq!(result.score, 85);
     assert_eq!(result.reason.unwrap().code, "dpi_match");
@@ -310,9 +373,9 @@ fn dpi_matches_pattern_in_payload() {
 
 #[test]
 fn dpi_no_match_returns_pass() {
-    let detector = DpiDetector::from_patterns(vec![
-        ("bad-agent".to_string(), "evil-bot/1.0".to_string()),
-    ]).unwrap();
+    let detector =
+        DpiDetector::from_patterns(vec![("bad-agent".to_string(), "evil-bot/1.0".to_string())])
+            .unwrap();
     let flow = make_flow_with_payload(b"GET / HTTP/1.1\r\nUser-Agent: curl/7.68\r\n");
     let result = detector.inspect(&make_packet("1.2.3.4", 80), &flow, &default_ctx());
     assert_eq!(result.score, 0);
@@ -320,9 +383,8 @@ fn dpi_no_match_returns_pass() {
 
 #[test]
 fn dpi_empty_payload_returns_pass() {
-    let detector = DpiDetector::from_patterns(vec![
-        ("test".to_string(), "anything".to_string()),
-    ]).unwrap();
+    let detector =
+        DpiDetector::from_patterns(vec![("test".to_string(), "anything".to_string())]).unwrap();
     let flow = default_flow();
     let result = detector.inspect(&make_packet("1.2.3.4", 80), &flow, &default_ctx());
     assert_eq!(result.score, 0);

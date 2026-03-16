@@ -17,7 +17,10 @@ fn get_or_create_same_key_returns_same_arc() {
     let k = key(1234, 80);
     let a = table.get_or_create(k.clone());
     let b = table.get_or_create(k.clone());
-    assert!(std::sync::Arc::ptr_eq(&a, &b), "same key must return same Arc");
+    assert!(
+        std::sync::Arc::ptr_eq(&a, &b),
+        "same key must return same Arc"
+    );
 }
 
 #[test]
@@ -51,8 +54,15 @@ fn invalidate_removes_entry_and_resets_state() {
 
     // After invalidation, a new Arc should be created with fresh state
     let arc2 = table.get_or_create(k.clone());
-    assert!(!std::sync::Arc::ptr_eq(&arc1, &arc2), "invalidated entry must produce a new Arc");
-    assert_eq!(arc2.lock().unwrap().syn_count, 0, "new Arc must have zeroed state");
+    assert!(
+        !std::sync::Arc::ptr_eq(&arc1, &arc2),
+        "invalidated entry must produce a new Arc"
+    );
+    assert_eq!(
+        arc2.lock().unwrap().syn_count,
+        0,
+        "new Arc must have zeroed state"
+    );
 }
 
 #[test]

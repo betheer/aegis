@@ -1,4 +1,6 @@
-use crate::model::{DecodedPacket, DetectionContext, DetectionEvent, Detector, DetectorResult, FlowState};
+use crate::model::{
+    DecodedPacket, DetectionContext, DetectionEvent, Detector, DetectorResult, FlowState,
+};
 use aegis_rules::model::BlockReason;
 use aegis_store::model::Severity;
 use std::collections::HashSet;
@@ -33,10 +35,19 @@ impl Default for GeoBlockDetector {
 }
 
 impl Detector for GeoBlockDetector {
-    fn name(&self) -> &'static str { "geo_block" }
-    fn weight(&self) -> f32 { 1.0 }
+    fn name(&self) -> &'static str {
+        "geo_block"
+    }
+    fn weight(&self) -> f32 {
+        1.0
+    }
 
-    fn inspect(&self, packet: &DecodedPacket, _flow: &FlowState, _ctx: &DetectionContext) -> DetectorResult {
+    fn inspect(
+        &self,
+        packet: &DecodedPacket,
+        _flow: &FlowState,
+        _ctx: &DetectionContext,
+    ) -> DetectorResult {
         let Some(ref reader) = self.reader else {
             return DetectorResult::pass();
         };

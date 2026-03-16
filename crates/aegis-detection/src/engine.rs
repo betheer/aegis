@@ -1,8 +1,6 @@
 use crate::{
     flow_table::FlowTable,
-    model::{
-        DecodedPacket, DetectionContext, DetectionVerdict, Detector, FlowKey, VerdictAction,
-    },
+    model::{DecodedPacket, DetectionContext, DetectionVerdict, Detector, FlowKey, VerdictAction},
 };
 use aegis_rules::model::Protocol;
 use rayon::prelude::*;
@@ -111,6 +109,10 @@ impl DetectionEngine {
         };
 
         let events = results.into_iter().filter_map(|r| r.event).collect();
-        DetectionVerdict { action, final_score, events }
+        DetectionVerdict {
+            action,
+            final_score,
+            events,
+        }
     }
 }

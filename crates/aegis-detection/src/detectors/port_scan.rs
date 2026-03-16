@@ -1,4 +1,6 @@
-use crate::model::{DecodedPacket, DetectionContext, DetectionEvent, Detector, DetectorResult, FlowState};
+use crate::model::{
+    DecodedPacket, DetectionContext, DetectionEvent, Detector, DetectorResult, FlowState,
+};
 use aegis_rules::model::BlockReason;
 use aegis_store::model::Severity;
 use dashmap::DashMap;
@@ -23,14 +25,25 @@ impl PortScanDetector {
 }
 
 impl Default for PortScanDetector {
-    fn default() -> Self { Self::new(60, 20) }
+    fn default() -> Self {
+        Self::new(60, 20)
+    }
 }
 
 impl Detector for PortScanDetector {
-    fn name(&self) -> &'static str { "port_scan" }
-    fn weight(&self) -> f32 { 1.5 }
+    fn name(&self) -> &'static str {
+        "port_scan"
+    }
+    fn weight(&self) -> f32 {
+        1.5
+    }
 
-    fn inspect(&self, packet: &DecodedPacket, _flow: &FlowState, _ctx: &DetectionContext) -> DetectorResult {
+    fn inspect(
+        &self,
+        packet: &DecodedPacket,
+        _flow: &FlowState,
+        _ctx: &DetectionContext,
+    ) -> DetectorResult {
         let Some(dst_port) = packet.dst_port else {
             return DetectorResult::pass();
         };

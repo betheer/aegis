@@ -1,4 +1,6 @@
-use crate::model::{DecodedPacket, DetectionContext, DetectionEvent, Detector, DetectorResult, FlowState};
+use crate::model::{
+    DecodedPacket, DetectionContext, DetectionEvent, Detector, DetectorResult, FlowState,
+};
 use aegis_rules::model::BlockReason;
 use aegis_store::model::Severity;
 use aho_corasick::AhoCorasick;
@@ -51,10 +53,19 @@ impl DpiDetector {
 }
 
 impl Detector for DpiDetector {
-    fn name(&self) -> &'static str { "dpi" }
-    fn weight(&self) -> f32 { 1.8 }
+    fn name(&self) -> &'static str {
+        "dpi"
+    }
+    fn weight(&self) -> f32 {
+        1.8
+    }
 
-    fn inspect(&self, _packet: &DecodedPacket, flow: &FlowState, _ctx: &DetectionContext) -> DetectorResult {
+    fn inspect(
+        &self,
+        _packet: &DecodedPacket,
+        flow: &FlowState,
+        _ctx: &DetectionContext,
+    ) -> DetectorResult {
         if flow.payload_buf.is_empty() {
             return DetectorResult::pass();
         }

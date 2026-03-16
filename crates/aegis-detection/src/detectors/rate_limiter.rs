@@ -1,4 +1,6 @@
-use crate::model::{DecodedPacket, DetectionContext, DetectionEvent, Detector, DetectorResult, FlowState};
+use crate::model::{
+    DecodedPacket, DetectionContext, DetectionEvent, Detector, DetectorResult, FlowState,
+};
 use aegis_rules::model::BlockReason;
 use aegis_store::model::Severity;
 use dashmap::DashMap;
@@ -15,7 +17,12 @@ struct TokenBucket {
 
 impl TokenBucket {
     fn new(rate: f64, capacity: f64) -> Self {
-        Self { tokens: capacity, last_refill: Instant::now(), rate, capacity }
+        Self {
+            tokens: capacity,
+            last_refill: Instant::now(),
+            rate,
+            capacity,
+        }
     }
 
     fn try_consume(&mut self) -> bool {
@@ -40,22 +47,38 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(rate: f64, capacity: f64) -> Self {
-        Self { buckets: DashMap::new(), rate, capacity }
+        Self {
+            buckets: DashMap::new(),
+            rate,
+            capacity,
+        }
     }
 }
 
 impl Default for RateLimiter {
-    fn default() -> Self { Self::new(1000.0, 2000.0) }
+    fn default() -> Self {
+        Self::new(1000.0, 2000.0)
+    }
 }
 
 impl Detector for RateLimiter {
-    fn name(&self) -> &'static str { "rate_limiter" }
-    fn weight(&self) -> f32 { 1.0 }
+    fn name(&self) -> &'static str {
+        "rate_limiter"
+    }
+    fn weight(&self) -> f32 {
+        1.0
+    }
 
-    fn inspect(&self, packet: &DecodedPacket, _flow: &FlowState, _ctx: &DetectionContext) -> DetectorResult {
+    fn inspect(
+        &self,
+        packet: &DecodedPacket,
+        _flow: &FlowState,
+        _ctx: &DetectionContext,
+    ) -> DetectorResult {
         // Clone the Arc out of the DashMap immediately, releasing the shard lock
         // before acquiring the TokenBucket Mutex. This prevents holding two locks simultaneously.
-        let bucket = self.buckets
+        let bucket = self
+            .buckets
             .entry(packet.src_ip)
             .or_insert_with(|| Arc::new(Mutex::new(TokenBucket::new(self.rate, self.capacity))))
             .clone();
