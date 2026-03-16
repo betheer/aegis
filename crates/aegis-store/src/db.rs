@@ -10,7 +10,7 @@ const KEY_LEN: usize = 32;
 
 /// A 32-byte database encryption key.
 #[derive(Clone)]
-pub struct DbKey(pub [u8; KEY_LEN]);
+pub struct DbKey(pub(crate) [u8; KEY_LEN]);
 
 impl DbKey {
     /// Derive from machine secret using Argon2id.
@@ -31,7 +31,12 @@ impl DbKey {
         Ok(Self(key))
     }
 
-    /// Generate a random key (for testing only).
+    /// Generate a random key.
+    ///
+    /// # Warning
+    /// This produces an ephemeral key with no derivation — **for testing only**.
+    /// Production code must use `DbKey::derive` with the machine secret.
+    #[doc(hidden)]
     pub fn random() -> Self {
         use rand::RngCore;
         let mut key = [0u8; KEY_LEN];
