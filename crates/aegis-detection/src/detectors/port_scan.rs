@@ -38,7 +38,7 @@ impl Detector for PortScanDetector {
         let cutoff = now - self.window;
 
         let mut entry = self.windows.entry(packet.src_ip).or_default();
-        while entry.front().map_or(false, |(t, _)| *t < cutoff) {
+        while entry.front().is_some_and(|(t, _)| *t < cutoff) {
             entry.pop_front();
         }
         entry.push_back((now, dst_port));

@@ -8,6 +8,7 @@ use aegis_detection::{
     detectors::ip_reputation::IpReputationDetector,
     detectors::geo_block::GeoBlockDetector,
     detectors::protocol_anomaly::ProtocolAnomalyDetector,
+    detectors::dpi::DpiDetector,
     Detector,
 };
 use aegis_rules::model::{Direction, Protocol};
@@ -272,4 +273,61 @@ fn protocol_anomaly_udp_always_passes() {
     pkt.tcp_flags = None;
     let result = detector.inspect(&pkt, &default_flow(), &default_ctx());
     assert_eq!(result.score, 0);
+}
+
+// ── DpiDetector ──────────────────────────────────────────────────────────────
+
+fn make_flow_with_payload(data: &[u8]) -> FlowState {
+    let mut state = FlowState::new();
+    state.append_payload(data);
+    state
+}
+
+#[test]
+fn dpi_matches_pattern_in_payload() {
+    let detector = DpiDetector::from_patterns(vec![
+        ("malware-c2".to_string(), "POST /beacon".to_string()),
+    ]).unwrap();
+    let flow = make_flow_with_payload(b"GET / HTTP/1.1\r\nHost: example.com\r\nPOST /beacon HTTP/1.1");
+    let result = detector.inspect(&make_packet("1.2.3.4", 80), &flow, &default_ctx());
+    assert_eq!(result.score, 85);
+    assert_eq!(result.reason.unwrap().code, "dpi_match");
+}
+
+#[test]
+fn dpi_no_match_returns_pass() {
+    let detector = DpiDetector::from_patterns(vec![
+        ("bad-agent".to_string(), "evil-bot/1.0".to_string()),
+    ]).unwrap();
+    let flow = make_flow_with_payload(b"GET / HTTP/1.1\r\nUser-Agent: curl/7.68\r\n");
+    let result = detector.inspect(&make_packet("1.2.3.4", 80), &flow, &default_ctx());
+    assert_eq!(result.score, 0);
+}
+
+#[test]
+fn dpi_empty_payload_returns_pass() {
+    let detector = DpiDetector::from_patterns(vec![
+        ("test".to_string(), "anything".to_string()),
+    ]).unwrap();
+    let flow = default_flow();
+    let result = detector.inspect(&make_packet("1.2.3.4", 80), &flow, &default_ctx());
+    assert_eq!(result.score, 0);
+}
+
+#[test]
+fn dpi_from_toml_parses_patterns() {
+    let toml = r#"
+[[patterns]]
+label = "sql-injection"
+pattern = "' OR '1'='1"
+
+[[patterns]]
+label = "shell-cmd"
+pattern = "/bin/sh"
+"#;
+    let detector = DpiDetector::from_toml(toml).unwrap();
+    assert_eq!(detector.pattern_count(), 2);
+    let flow = make_flow_with_payload(b"SELECT * FROM users WHERE id=1' OR '1'='1");
+    let result = detector.inspect(&make_packet("1.2.3.4", 3306), &flow, &default_ctx());
+    assert_eq!(result.score, 85);
 }
