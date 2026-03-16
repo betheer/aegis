@@ -6,6 +6,7 @@ use aegis_detection::{
     detectors::syn_flood::SynFloodDetector,
     detectors::rate_limiter::RateLimiter,
     detectors::ip_reputation::IpReputationDetector,
+    detectors::geo_block::GeoBlockDetector,
     Detector,
 };
 use aegis_rules::model::{Direction, Protocol};
@@ -179,4 +180,25 @@ fn ip_reputation_skips_invalid_lines() {
         detector.inspect(&make_packet("5.6.7.8", 80), &default_flow(), &default_ctx()).score,
         100
     );
+}
+
+// ── GeoBlockDetector ─────────────────────────────────────────────────────────
+
+#[test]
+fn geo_block_no_db_always_passes() {
+    // Without a MaxMind DB file, geo lookup is disabled — all packets pass.
+    let detector = GeoBlockDetector::new(None, vec!["CN".to_string(), "RU".to_string()]);
+    let result = detector.inspect(&make_packet("1.2.3.4", 80), &default_flow(), &default_ctx());
+    assert_eq!(result.score, 0, "no DB → always pass");
+}
+
+#[test]
+fn geo_block_no_countries_always_passes() {
+    // Even with a DB path (non-existent file), no blocked countries → pass.
+    let detector = GeoBlockDetector::new(
+        Some(std::path::Path::new("/nonexistent/GeoLite2.mmdb")),
+        vec![],
+    );
+    let result = detector.inspect(&make_packet("1.2.3.4", 80), &default_flow(), &default_ctx());
+    assert_eq!(result.score, 0);
 }
