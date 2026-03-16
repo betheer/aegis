@@ -7,6 +7,7 @@ use aegis_detection::{
     detectors::rate_limiter::RateLimiter,
     detectors::ip_reputation::IpReputationDetector,
     detectors::geo_block::GeoBlockDetector,
+    detectors::protocol_anomaly::ProtocolAnomalyDetector,
     Detector,
 };
 use aegis_rules::model::{Direction, Protocol};
@@ -200,5 +201,75 @@ fn geo_block_no_countries_always_passes() {
         vec![],
     );
     let result = detector.inspect(&make_packet("1.2.3.4", 80), &default_flow(), &default_ctx());
+    assert_eq!(result.score, 0);
+}
+
+// ── ProtocolAnomalyDetector ──────────────────────────────────────────────────
+
+fn make_tcp_packet_with_flags(flags: TcpFlags) -> DecodedPacket {
+    DecodedPacket {
+        src_ip: "1.2.3.4".parse().unwrap(),
+        dst_ip: "10.0.0.1".parse().unwrap(),
+        src_port: Some(50000),
+        dst_port: Some(80),
+        protocol: Protocol::Tcp,
+        direction: Direction::Inbound,
+        tcp_flags: Some(flags),
+        payload: Bytes::new(),
+        packet_len: 40,
+    }
+}
+
+#[test]
+fn protocol_anomaly_syn_rst_triggers() {
+    let detector = ProtocolAnomalyDetector;
+    let flags = TcpFlags { syn: true, rst: true, ..Default::default() };
+    let result = detector.inspect(&make_tcp_packet_with_flags(flags), &default_flow(), &default_ctx());
+    assert_eq!(result.score, 70);
+    assert_eq!(result.reason.unwrap().code, "syn_rst");
+}
+
+#[test]
+fn protocol_anomaly_syn_fin_triggers() {
+    let detector = ProtocolAnomalyDetector;
+    let flags = TcpFlags { syn: true, fin: true, ..Default::default() };
+    let result = detector.inspect(&make_tcp_packet_with_flags(flags), &default_flow(), &default_ctx());
+    assert_eq!(result.score, 70);
+    assert_eq!(result.reason.unwrap().code, "syn_fin");
+}
+
+#[test]
+fn protocol_anomaly_null_scan_triggers() {
+    let detector = ProtocolAnomalyDetector;
+    let flags = TcpFlags::default(); // all false
+    let result = detector.inspect(&make_tcp_packet_with_flags(flags), &default_flow(), &default_ctx());
+    assert_eq!(result.score, 60);
+    assert_eq!(result.reason.unwrap().code, "null_scan");
+}
+
+#[test]
+fn protocol_anomaly_xmas_scan_triggers() {
+    let detector = ProtocolAnomalyDetector;
+    let flags = TcpFlags { syn: true, ack: true, fin: true, rst: true, psh: true, urg: true };
+    let result = detector.inspect(&make_tcp_packet_with_flags(flags), &default_flow(), &default_ctx());
+    assert_eq!(result.score, 75);
+    assert_eq!(result.reason.unwrap().code, "xmas_scan");
+}
+
+#[test]
+fn protocol_anomaly_normal_syn_passes() {
+    let detector = ProtocolAnomalyDetector;
+    let flags = TcpFlags { syn: true, ..Default::default() };
+    let result = detector.inspect(&make_tcp_packet_with_flags(flags), &default_flow(), &default_ctx());
+    assert_eq!(result.score, 0);
+}
+
+#[test]
+fn protocol_anomaly_udp_always_passes() {
+    let detector = ProtocolAnomalyDetector;
+    let mut pkt = make_packet("1.2.3.4", 53);
+    pkt.protocol = Protocol::Udp;
+    pkt.tcp_flags = None;
+    let result = detector.inspect(&pkt, &default_flow(), &default_ctx());
     assert_eq!(result.score, 0);
 }
