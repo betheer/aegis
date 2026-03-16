@@ -33,9 +33,13 @@ impl IpStatsCache {
         }
         if score > 0 {
             entry.alert_count += 1;
-            // Rolling average (simple exponential, alpha=0.1)
-            entry.rolling_risk_score =
-                (entry.rolling_risk_score as f32 * 0.9 + score as f32 * 0.1) as u8;
+            // Rolling EMA (alpha=0.1). Seed with first observed value to avoid
+            // 90% cold-start suppression on the first packet.
+            entry.rolling_risk_score = if entry.rolling_risk_score == 0 {
+                score
+            } else {
+                (entry.rolling_risk_score as f32 * 0.9 + score as f32 * 0.1) as u8
+            };
         }
     }
 

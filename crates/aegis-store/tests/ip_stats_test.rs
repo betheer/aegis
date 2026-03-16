@@ -62,13 +62,14 @@ fn flush_twice_upserts_correctly() {
     cache.record_packet(ip, true, 85);
     cache.flush(&mut conn).unwrap();
 
-    let (total, blocked): (i64, i64) = conn
+    let (total, blocked, risk): (i64, i64, u8) = conn
         .query_row(
-            "SELECT total_packets, blocked_count FROM ip_stats WHERE ip = '9.9.9.9'",
+            "SELECT total_packets, blocked_count, risk_score FROM ip_stats WHERE ip = '9.9.9.9'",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
     assert_eq!(total, 2);
     assert_eq!(blocked, 1);
+    assert!(risk > 0, "risk_score should be persisted after flush");
 }
