@@ -64,3 +64,22 @@ fn disabled_rules_not_compiled() {
         }
     }
 }
+
+#[test]
+fn compile_dst_port_range_contains_range_match() {
+    let rule = Rule {
+        id: "range-test".to_string(),
+        priority: 10,
+        name: "Range Match".to_string(),
+        enabled: true,
+        matches: vec![Match::DstPort(PortRange::Range {
+            start: 1000,
+            end: 2000,
+        })],
+        action: Action::Allow,
+        log: false,
+    };
+    let ruleset = compile_rules(&[rule], "v0.0.4");
+    assert!(ruleset.nftables_json.contains("\"range\":[1000,2000]"));
+    assert!(ruleset.nftables_json.contains("\"field\":\"dport\""));
+}
