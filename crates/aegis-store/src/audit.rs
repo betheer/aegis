@@ -37,7 +37,7 @@ impl AuditLog {
         let prev_hash = self.last_hmac(conn)?;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("System clock set before UNIX epoch")
             .as_millis() as i64;
 
         let entry_hmac = self.compute_hmac(&prev_hash, ts, actor, action, detail.unwrap_or(""));

@@ -99,6 +99,6 @@ impl Default for IpStatsCache {
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("System clock set before UNIX epoch")
         .as_millis() as i64
 }
