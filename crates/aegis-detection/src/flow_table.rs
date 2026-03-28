@@ -1,12 +1,12 @@
 use crate::model::{FlowKey, FlowState};
 use moka::sync::Cache;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// Thread-safe, LRU+TTI flow table backed by moka.
-/// Stores `Arc<Mutex<FlowState>>` so callers can mutate flow state in-place.
+/// Stores `Arc<RwLock<FlowState>>` so callers can mutate flow state in-place.
 pub struct FlowTable {
-    cache: Cache<FlowKey, Arc<Mutex<FlowState>>>,
+    cache: Cache<FlowKey, Arc<RwLock<FlowState>>>,
 }
 
 impl FlowTable {
@@ -22,9 +22,9 @@ impl FlowTable {
     /// Get or atomically create a FlowState for the given key.
     /// moka guarantees the initializer runs at most once per key.
     #[must_use]
-    pub fn get_or_create(&self, key: FlowKey) -> Arc<Mutex<FlowState>> {
+    pub fn get_or_create(&self, key: FlowKey) -> Arc<RwLock<FlowState>> {
         self.cache
-            .get_with(key, || Arc::new(Mutex::new(FlowState::new())))
+            .get_with(key, || Arc::new(RwLock::new(FlowState::new())))
     }
 
     /// Remove a flow (e.g., after it is confirmed closed).

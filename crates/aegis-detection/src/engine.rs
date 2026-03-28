@@ -63,15 +63,16 @@ impl DetectionEngine {
         let flow_arc = self.flow_table.get_or_create(flow_key);
 
         // Update flow state and capture a snapshot for detectors.
-        let flow_snapshot = {
-            let mut flow = flow_arc.lock().unwrap();
+        {
+            let mut flow = flow_arc.write().unwrap();
+
             if let Some(flags) = &packet.tcp_flags {
                 flow.update_tcp_flags(flags);
             }
             if !packet.payload.is_empty() {
                 flow.append_payload(&packet.payload);
             }
-            flow.clone()
+
         };
 
         let ctx = DetectionContext {
@@ -80,10 +81,11 @@ impl DetectionEngine {
         };
 
         // Run all detectors in parallel via rayon.
+        let flow_read = flow_arc.read().unwrap();
         let results: Vec<_> = self
             .detectors
             .par_iter()
-            .map(|d| d.inspect(packet, &flow_snapshot, &ctx))
+            .map(|d| d.inspect(packet, &flow_read, &ctx))
             .collect();
 
         // Weighted average score aggregation.

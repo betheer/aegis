@@ -53,11 +53,11 @@ impl Detector for GeoBlockDetector {
         };
 
         let country_code: Option<String> = reader
-            .lookup::<maxminddb::geoip2::Country>(packet.src_ip)
+            .lookup(packet.src_ip)
             .ok()
-            .and_then(|c| c.country)
+            .map(|r: maxminddb::LookupResult<Vec<u8>>| r.decode::<maxminddb::geoip2::Country>().ok()).flatten().flatten().map(|c: maxminddb::geoip2::Country| c.country)
             .and_then(|c| c.iso_code)
-            .map(|s| s.to_string());
+            .map(|s: &str| s.to_string());
 
         if let Some(code) = country_code {
             if self.blocked_countries.contains(&code) {
