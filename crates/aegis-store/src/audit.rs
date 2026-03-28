@@ -122,8 +122,15 @@ impl AuditLog {
     ) -> String {
         let mut mac =
             HmacSha256::new_from_slice(&self.hmac_key).expect("HMAC can take key of any size");
-        let input = format!("{}|{}|{}|{}|{}", prev_hash, ts, actor, action, detail);
-        mac.update(input.as_bytes());
+        mac.update(prev_hash.as_bytes());
+        mac.update(b"|");
+        mac.update(ts.to_string().as_bytes());
+        mac.update(b"|");
+        mac.update(actor.as_bytes());
+        mac.update(b"|");
+        mac.update(action.as_bytes());
+        mac.update(b"|");
+        mac.update(detail.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
 }
