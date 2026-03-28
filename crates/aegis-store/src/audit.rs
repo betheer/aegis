@@ -1,6 +1,7 @@
 use crate::error::{Result, StoreError};
 use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection};
+use serde_json;
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -11,7 +12,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// of the previous entry. Tampering with any entry breaks the chain — this is
 /// detected by `verify_chain()`.
 ///
-/// HMAC input format: `"{prev_hash}|{ts}|{actor}|{action}|{detail}"`
+/// HMAC input format: JSON-serialized tuple `(prev_hash, ts, actor, action, detail)`
 pub struct AuditLog {
     hmac_key: Vec<u8>,
     genesis_hash: String,
@@ -122,8 +123,31 @@ impl AuditLog {
     ) -> String {
         let mut mac =
             HmacSha256::new_from_slice(&self.hmac_key).expect("HMAC can take key of any size");
-        let input = format!("{}|{}|{}|{}|{}", prev_hash, ts, actor, action, detail);
-        mac.update(input.as_bytes());
+        let input = serde_json::to_vec(&(prev_hash, ts, actor, action, detail))
+            .expect("JSON serialization of simple types should not fail");
+        mac.update(&input);
         hex::encode(mac.finalize().into_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hmac_no_collision() {
+        let log = AuditLog::new(b"key", "genesis");
+        let ts = 12345;
+        let prev_hash = "prev";
+        let detail = "detail";
+
+        // These would have collided with a simple "|" delimiter
+        // Case 1: actor = "admin", action = "login|extra"
+        let h1 = log.compute_hmac(prev_hash, ts, "admin", "login|extra", detail);
+
+        // Case 2: actor = "admin|login", action = "extra"
+        let h2 = log.compute_hmac(prev_hash, ts, "admin|login", "extra", detail);
+
+        assert_ne!(h1, h2, "HMAC collision should no longer occur");
     }
 }
