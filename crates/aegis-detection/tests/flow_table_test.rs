@@ -47,7 +47,7 @@ fn invalidate_removes_entry_and_resets_state() {
     let table = FlowTable::new(1000);
     let k = key(7777, 443);
     let arc1 = table.get_or_create(k.clone());
-    arc1.lock().unwrap().syn_count = 99;
+    arc1.write().unwrap().syn_count = 99;
 
     table.invalidate(&k);
     table.run_pending_tasks();
@@ -59,7 +59,7 @@ fn invalidate_removes_entry_and_resets_state() {
         "invalidated entry must produce a new Arc"
     );
     assert_eq!(
-        arc2.lock().unwrap().syn_count,
+        arc2.write().unwrap().syn_count,
         0,
         "new Arc must have zeroed state"
     );
@@ -72,6 +72,6 @@ fn flow_state_mutations_visible_across_handles() {
     let arc1 = table.get_or_create(k.clone());
     let arc2 = table.get_or_create(k.clone());
 
-    arc1.lock().unwrap().syn_count = 42;
-    assert_eq!(arc2.lock().unwrap().syn_count, 42);
+    arc1.write().unwrap().syn_count = 42;
+    assert_eq!(arc2.write().unwrap().syn_count, 42);
 }
